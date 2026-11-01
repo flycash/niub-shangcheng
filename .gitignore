@@ -1,0 +1,70 @@
+# Environment and secrets
+.env
+.env.*
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+!.env.example
+!**/.env.example
+
+# Local model configuration
+agent-service/config/llm.yaml
+agent-service/config/*.local.yaml
+agent-service/config/*.secret.yaml
+!agent-service/config/llm.example.yaml
+
+# Generated conversation data
+agent-service/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Node.js and Next.js
+node_modules/
+.pnpm-store/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+.turbo/
+
+# IDE and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+.tmp/
+
+# Agent session exports and packaged artifacts
+# codex-session-*.md
+.codex/
+exports/
+artifacts/
+*.tar
+*.tar.gz
+*.zip

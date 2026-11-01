@@ -1,0 +1,9 @@
+[tool.uv.workspace]
+members = ["agent-service", "mall-service"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["agent-service/src", "mall-service/src"]
+testpaths = ["agent-service/tests", "mall-service/tests"]

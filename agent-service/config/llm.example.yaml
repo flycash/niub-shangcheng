@@ -1,0 +1,12 @@
+llm:
+  base_url: "https://api.deepseek.com"
+  api_key: "replace-with-your-api-key"
+  model: "deepseek-flash"
+
+  # Optional generation settings. Remove them if your provider does not support them.
+  temperature: 0.7
+  max_tokens: 800
+  timeout_seconds: 60
+  max_turns: 5
+  tool_timeout_seconds: 8
+  prompt_file: "../prompts/shopping_agent.md"
