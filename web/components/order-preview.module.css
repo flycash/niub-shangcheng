@@ -1,0 +1,262 @@
+.page {
+  min-height: 100vh;
+  padding-bottom: 64px;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 84% 8%, rgba(214, 240, 106, 0.32), transparent 26%),
+    var(--paper);
+}
+
+.topbar {
+  width: min(1080px, calc(100% - 40px));
+  height: 88px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-size: 24px;
+  font-weight: 900;
+  letter-spacing: -1px;
+}
+
+.brand span {
+  color: var(--orange);
+}
+
+.backLink {
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.sheet {
+  width: min(1080px, calc(100% - 40px));
+  margin: 38px auto 0;
+  padding: clamp(24px, 4vw, 48px);
+  border: 1px solid var(--line);
+  background: rgba(255, 253, 248, 0.9);
+  box-shadow: 0 24px 80px rgba(36, 76, 58, 0.08);
+}
+
+.stateText {
+  margin: 80px 0;
+  text-align: center;
+}
+
+.errorState {
+  padding: 50px 0;
+  text-align: center;
+}
+
+.errorState h1 {
+  font-family: "Songti SC", serif;
+}
+
+.errorState a {
+  display: inline-block;
+  margin-top: 16px;
+  color: var(--green);
+  font-weight: 700;
+}
+
+.heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 26px;
+  border-bottom: 1px solid var(--line);
+}
+
+.heading p {
+  margin: 0;
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 2px;
+}
+
+.heading h1 {
+  margin: 8px 0;
+  font-family: "Songti SC", serif;
+  font-size: clamp(34px, 5vw, 56px);
+}
+
+.heading span {
+  color: #7b8077;
+  font-size: 11px;
+}
+
+.heading > b {
+  padding: 7px 12px;
+  border-radius: 999px;
+  font-size: 10px;
+}
+
+.pending {
+  color: #6d5313;
+  background: #f4eab8;
+}
+
+.paid {
+  color: var(--green);
+  background: var(--lime);
+}
+
+.paidNotice {
+  margin-top: 22px;
+  padding: 15px 17px;
+  display: grid;
+  gap: 4px;
+  color: var(--green);
+  border: 1px solid rgba(36, 76, 58, 0.2);
+  background: rgba(214, 240, 106, 0.22);
+}
+
+.paidNotice span {
+  color: #627064;
+  font-size: 11px;
+}
+
+.contentGrid {
+  padding-top: 30px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.8fr);
+  gap: 44px;
+}
+
+.items h2,
+.summary h2 {
+  margin: 0 0 16px;
+  font-size: 13px;
+  letter-spacing: 0.8px;
+}
+
+.item {
+  padding: 14px 0;
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  gap: 13px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+}
+
+.itemMark {
+  width: 48px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  color: var(--green);
+  background: var(--cream);
+  border-radius: 22px 22px 5px 5px;
+  font-family: "Songti SC", serif;
+  font-size: 20px;
+  font-weight: 900;
+}
+
+.item > div:nth-child(2) {
+  display: grid;
+  gap: 4px;
+}
+
+.item span {
+  color: #7b8077;
+  font-size: 10px;
+}
+
+.item > b {
+  font-size: 13px;
+}
+
+.summary {
+  padding: 20px;
+  background: #f4f0e5;
+}
+
+.address {
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.address span {
+  color: #72786f;
+}
+
+.summary dl {
+  margin: 24px 0 18px;
+  display: grid;
+  gap: 10px;
+}
+
+.summary dl > div {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.summary dd {
+  margin: 0;
+}
+
+.summary .total {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  color: var(--green);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.payButton {
+  width: 100%;
+  padding: 14px 18px;
+  color: white;
+  background: var(--green);
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.payButton:disabled {
+  color: #777b73;
+  background: #d8d5ca;
+  cursor: default;
+}
+
+.hint {
+  margin: 9px 0 0;
+  color: #858a82;
+  font-size: 9px;
+  text-align: center;
+}
+
+.error {
+  color: #9b3c29;
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .contentGrid {
+    grid-template-columns: 1fr;
+    gap: 26px;
+  }
+
+  .sheet {
+    width: min(100% - 24px, 1080px);
+    margin-top: 18px;
+    padding: 22px 18px;
+  }
+
+  .heading {
+    align-items: flex-start;
+    flex-direction: column-reverse;
+  }
+}

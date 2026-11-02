@@ -17,6 +17,10 @@ class LLMConfigError(Exception):
     """Raised when the LLM configuration cannot be loaded or validated."""
 
 
+MIN_RECOMMENDATION_TURNS = 10
+MAX_RECOMMENDATION_TURNS = 100
+
+
 class LLMConfig(BaseModel):
     base_url: str
     api_key: SecretStr
@@ -24,7 +28,11 @@ class LLMConfig(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)
     timeout_seconds: float = Field(default=60, gt=0, le=600)
-    max_turns: int = Field(default=5, ge=1, le=12)
+    max_turns: int = Field(
+        default=MIN_RECOMMENDATION_TURNS,
+        ge=MIN_RECOMMENDATION_TURNS,
+        le=MAX_RECOMMENDATION_TURNS,
+    )
     tool_timeout_seconds: float = Field(default=8, gt=0, le=60)
     prompt_file: str | None = None
     system_prompt: str | None = None

@@ -9,13 +9,15 @@ from .agent_runner import sse_event, stream_agent_reply
 from .chat import compose_reply
 from .llm_config import LLMConfig, LLMConfigError, load_llm_config
 from .mall_client import CatalogUnavailable, MallClient, get_mall_client
-from .mock_mall import MallGateway, get_mall_gateway
+from .mall_gateway import MallGateway
 from .models import (
     ChatRequest,
     ChatResponse,
     ConversationDetail,
     ConversationList,
     ConversationMessage,
+    OrderLink,
+    PlanState,
     Product,
     StreamChatRequest,
     StoredMessage,
@@ -37,6 +39,33 @@ def to_conversation_messages(
     ]
 
 
+def latest_plan_state(
+    messages: Sequence[StoredMessage],
+) -> PlanState | None:
+    for message in reversed(messages):
+        if message.plan_state is not None:
+            return message.plan_state
+    return None
+
+
+def latest_recommendations(
+    messages: Sequence[StoredMessage],
+) -> list[Product]:
+    for message in reversed(messages):
+        if message.recommendations:
+            return message.recommendations
+    return []
+
+
+def latest_orders(
+    messages: Sequence[StoredMessage],
+) -> list[OrderLink]:
+    for message in reversed(messages):
+        if message.orders:
+            return message.orders
+    return []
+
+
 async def persisted_agent_stream(
     conversation_id: str,
     conversation_title: str,
@@ -49,7 +78,28 @@ async def persisted_agent_stream(
     content_parts: list[str] = []
     recommendations: dict[str, Product] = {}
     tool_trace: list[ToolTrace] = []
+    plan_state: PlanState | None = None
+    created_orders: dict[str, OrderLink] = {}
     persisted = False
+
+    def message_metadata() -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "recommendations": [
+                product.model_dump(mode="json")
+                for product in recommendations.values()
+            ],
+            "tool_trace": [
+                trace.model_dump(mode="json") for trace in tool_trace
+            ],
+        }
+        if plan_state is not None:
+            metadata["plan_state"] = plan_state.model_dump(mode="json")
+        if created_orders:
+            metadata["orders"] = [
+                order.model_dump(mode="json")
+                for order in created_orders.values()
+            ]
+        return metadata
 
     yield sse_event(
         {
@@ -64,6 +114,9 @@ async def persisted_agent_stream(
             to_conversation_messages(context),
             config,
             mall,
+            previous_plan_state=latest_plan_state(context),
+            previous_recommendations=latest_recommendations(context),
+            previous_orders=latest_orders(context),
         ):
             event_type = event.get("type")
             raw_event = sse_event(event)
@@ -80,6 +133,21 @@ async def persisted_agent_stream(
                     if isinstance(product, dict):
                         parsed = Product.model_validate(product)
                         recommendations[parsed.id] = parsed
+                yield raw_event
+                continue
+
+            if event_type == "plan_updated":
+                plan_state_payload = event.get("plan_state")
+                if isinstance(plan_state_payload, dict):
+                    plan_state = PlanState.model_validate(plan_state_payload)
+                yield raw_event
+                continue
+
+            if event_type == "order_created":
+                order_payload = event.get("order")
+                if isinstance(order_payload, dict):
+                    order = OrderLink.model_validate(order_payload)
+                    created_orders[order.order_id] = order
                 yield raw_event
                 continue
 
@@ -117,20 +185,19 @@ async def persisted_agent_stream(
                         for trace in event["tool_trace"]
                         if isinstance(trace, dict)
                     ]
+                plan_state_payload = event.get("plan_state")
+                if isinstance(plan_state_payload, dict):
+                    plan_state = PlanState.model_validate(plan_state_payload)
+                if isinstance(event.get("orders"), list):
+                    for order_payload in event["orders"]:
+                        if isinstance(order_payload, dict):
+                            order = OrderLink.model_validate(order_payload)
+                            created_orders[order.order_id] = order
                 store.finish_message(
                     assistant_message_id,
                     "".join(content_parts) or error_message,
                     "failed",
-                    metadata={
-                        "recommendations": [
-                            product.model_dump(mode="json")
-                            for product in recommendations.values()
-                        ],
-                        "tool_trace": [
-                            trace.model_dump(mode="json")
-                            for trace in tool_trace
-                        ],
-                    },
+                    metadata=message_metadata(),
                 )
                 persisted = True
                 yield raw_event
@@ -143,20 +210,19 @@ async def persisted_agent_stream(
                         for trace in event["tool_trace"]
                         if isinstance(trace, dict)
                     ]
+                plan_state_payload = event.get("plan_state")
+                if isinstance(plan_state_payload, dict):
+                    plan_state = PlanState.model_validate(plan_state_payload)
+                if isinstance(event.get("orders"), list):
+                    for order_payload in event["orders"]:
+                        if isinstance(order_payload, dict):
+                            order = OrderLink.model_validate(order_payload)
+                            created_orders[order.order_id] = order
                 store.finish_message(
                     assistant_message_id,
                     "".join(content_parts),
                     "completed",
-                    metadata={
-                        "recommendations": [
-                            product.model_dump(mode="json")
-                            for product in recommendations.values()
-                        ],
-                        "tool_trace": [
-                            trace.model_dump(mode="json")
-                            for trace in tool_trace
-                        ],
-                    },
+                    metadata=message_metadata(),
                 )
                 persisted = True
                 yield raw_event
@@ -167,15 +233,7 @@ async def persisted_agent_stream(
             assistant_message_id,
             "".join(content_parts) or error_message,
             "failed",
-            metadata={
-                "recommendations": [
-                    product.model_dump(mode="json")
-                    for product in recommendations.values()
-                ],
-                "tool_trace": [
-                    trace.model_dump(mode="json") for trace in tool_trace
-                ],
-            },
+            metadata=message_metadata(),
         )
         persisted = True
         yield sse_event(
@@ -194,15 +252,7 @@ async def persisted_agent_stream(
             assistant_message_id,
             "".join(content_parts) or error_message,
             "failed",
-            metadata={
-                "recommendations": [
-                    product.model_dump(mode="json")
-                    for product in recommendations.values()
-                ],
-                "tool_trace": [
-                    trace.model_dump(mode="json") for trace in tool_trace
-                ],
-            },
+            metadata=message_metadata(),
         )
         persisted = True
         yield sse_event(
@@ -218,15 +268,7 @@ async def persisted_agent_stream(
                 assistant_message_id,
                 "".join(content_parts) or "客户端断开，回复未完成。",
                 "failed",
-                metadata={
-                    "recommendations": [
-                        product.model_dump(mode="json")
-                        for product in recommendations.values()
-                    ],
-                    "tool_trace": [
-                        trace.model_dump(mode="json") for trace in tool_trace
-                    ],
-                },
+                metadata=message_metadata(),
             )
 
 
@@ -302,7 +344,7 @@ async def chat(
 async def stream_chat(
     request: StreamChatRequest,
     store: ConversationStore = Depends(get_conversation_store),
-    mall: MallGateway = Depends(get_mall_gateway),
+    mall: MallGateway = Depends(get_mall_client),
 ) -> StreamingResponse:
     if request.conversation_id:
         conversation = store.get_conversation(

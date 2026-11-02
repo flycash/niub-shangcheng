@@ -7,6 +7,7 @@ llm:
   temperature: 0.7
   max_tokens: 800
   timeout_seconds: 60
-  max_turns: 5
+  # 串行调用多个数据源时至少需要 10 个模型/工具回合。
+  max_turns: 10
   tool_timeout_seconds: 8
   prompt_file: "../prompts/shopping_agent.md"

@@ -45,7 +45,58 @@ class FakeMallClient:
         return ProductList(items=products, total=1)
 
 
-async def fake_agent_stream(messages, config, mall):
+PLAN_STATE = {
+    "plan": {
+        "plan_id": "plan-test",
+        "goal": "找到合适的商品",
+        "steps": [
+            {
+                "step_id": "search",
+                "title": "搜索商品",
+                "objective": "获取候选商品",
+                "kind": "retrieval",
+                "depends_on": [],
+                "metadata": {},
+            },
+            {
+                "step_id": "submit",
+                "title": "提交推荐",
+                "objective": "生成最终推荐",
+                "kind": "decision",
+                "depends_on": ["search"],
+                "metadata": {},
+            },
+        ],
+    },
+    "status": "active",
+    "current_step_id": "submit",
+    "step_states": [
+        {"step_id": "search", "status": "completed", "note": "找到 1 件商品"},
+        {"step_id": "submit", "status": "in_progress", "note": None},
+    ],
+    "summary": "已完成候选搜索",
+    "next_action": "提交最终推荐",
+    "revision": 2,
+    "updated_at": "2026-11-02T12:00:00+00:00",
+}
+
+ORDER_LINK = {
+    "order_id": "order-test",
+    "status": "pending_payment",
+    "total_cents": 6900,
+    "preview_path": "/orders/order-test",
+    "ordered_at": "2026-11-02T12:10:00+00:00",
+}
+
+
+async def fake_agent_stream(
+    messages,
+    config,
+    mall,
+    previous_plan_state=None,
+    previous_recommendations=None,
+    previous_orders=None,
+):
     yield {"type": "start", "message_id": "assistant-test"}
     yield {
         "type": "tool_started",
@@ -61,6 +112,16 @@ async def fake_agent_stream(messages, config, mall):
         "tool": "search_products",
     }
     yield {
+        "type": "plan_updated",
+        "message_id": "assistant-test",
+        "plan_state": PLAN_STATE,
+    }
+    yield {
+        "type": "order_created",
+        "message_id": "assistant-test",
+        "order": ORDER_LINK,
+    }
+    yield {
         "type": "recommendations",
         "message_id": "assistant-test",
         "products": [
@@ -74,6 +135,10 @@ async def fake_agent_stream(messages, config, mall):
                 "stock": 10,
                 "tags": ["通勤"],
                 "image_url": None,
+                "is_ad": True,
+                "ad_label": "广告",
+                "ad_id": "ad-test",
+                "campaign_id": "campaign-test",
             }
         ],
     }
@@ -94,6 +159,8 @@ async def fake_agent_stream(messages, config, mall):
                 "summary": "1 product",
             }
         ],
+        "plan_state": PLAN_STATE,
+        "orders": [ORDER_LINK],
     }
 
 
@@ -144,6 +211,8 @@ def test_stream_chat_persists_completed_conversation(
     assert response.headers["content-type"].startswith("text/event-stream")
     assert '"type": "conversation"' in response.text
     assert '"type": "tool_started"' in response.text
+    assert '"type": "plan_updated"' in response.text
+    assert '"type": "order_created"' in response.text
     assert '"type": "recommendations"' in response.text
     assert "真实模型回复" in response.text
     assert '"type": "done"' in response.text
@@ -162,7 +231,14 @@ def test_stream_chat_persists_completed_conversation(
     assert detail.messages[1].content == "真实模型回复"
     assert detail.messages[1].status == "completed"
     assert detail.messages[1].recommendations[0].id == "tote"
+    assert detail.messages[1].recommendations[0].is_ad is True
+    assert detail.messages[1].recommendations[0].ad_label == "广告"
     assert detail.messages[1].tool_trace[0].tool == "search_products"
+    assert detail.messages[1].plan_state is not None
+    assert detail.messages[1].plan_state.plan.plan_id == "plan-test"
+    assert detail.messages[1].plan_state.current_step_id == "submit"
+    assert detail.messages[1].orders[0].order_id == "order-test"
+    assert detail.messages[1].orders[0].preview_path == "/orders/order-test"
 
 
 def test_stream_chat_requires_message(
@@ -206,7 +282,14 @@ def test_stream_chat_persists_partial_reply_on_error(
     store: ConversationStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def failing_stream(messages, config, mall):
+    async def failing_stream(
+        messages,
+        config,
+        mall,
+        previous_plan_state=None,
+        previous_recommendations=None,
+        previous_orders=None,
+    ):
         yield {"type": "start", "message_id": "assistant-test"}
         yield {
             "type": "delta",
@@ -238,6 +321,73 @@ def test_stream_chat_persists_partial_reply_on_error(
     assert detail is not None
     assert detail.messages[1].content == "已经生成的部分"
     assert detail.messages[1].status == "failed"
+
+
+def test_stream_chat_passes_previous_plan_state_to_next_turn(
+    store: ConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation_id = store.create_conversation(1, "继续推荐")
+    store.add_message(conversation_id, "user", "先推荐商品", "completed")
+    store.add_message(
+        conversation_id,
+        "assistant",
+        "已完成第一轮",
+        "completed",
+        metadata={
+            "plan_state": PLAN_STATE,
+            "recommendations": [
+                {
+                    "id": "tote",
+                    "name": "帆布托特包",
+                    "description": "日常通勤",
+                    "price_cents": 6900,
+                    "category": "箱包",
+                }
+            ],
+            "orders": [ORDER_LINK],
+        },
+    )
+    captured: dict[str, object] = {}
+
+    async def capturing_stream(
+        messages,
+        config,
+        mall,
+        previous_plan_state=None,
+        previous_recommendations=None,
+        previous_orders=None,
+    ):
+        captured["plan_state"] = previous_plan_state
+        captured["previous_recommendations"] = previous_recommendations
+        captured["previous_orders"] = previous_orders
+        yield {"type": "start", "message_id": "assistant-next"}
+        yield {"type": "delta", "content": "继续完成"}
+        yield {
+            "type": "done",
+            "tool_trace": [],
+            "plan_state": previous_plan_state.model_dump(mode="json")
+            if previous_plan_state
+            else None,
+        }
+
+    monkeypatch.setattr(api_module, "load_llm_config", lambda: TEST_CONFIG)
+    monkeypatch.setattr(api_module, "stream_agent_reply", capturing_stream)
+
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "conversation_id": conversation_id,
+            "message": "继续刚才的计划",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["plan_state"] is not None
+    assert captured["plan_state"].plan.plan_id == "plan-test"
+    assert captured["plan_state"].current_step_id == "submit"
+    assert captured["previous_recommendations"][0].id == "tote"
+    assert captured["previous_orders"][0].order_id == "order-test"
 
 
 def test_conversation_history_endpoints(store: ConversationStore) -> None:

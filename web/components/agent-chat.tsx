@@ -21,6 +21,8 @@ type Message = {
   failed?: boolean;
   products?: Product[];
   toolTrace?: ToolTrace[];
+  planState?: PlanState | null;
+  orders?: OrderLink[];
 };
 
 type Product = {
@@ -33,6 +35,8 @@ type Product = {
   stock: number | null;
   tags: string[];
   image_url: string | null;
+  is_ad: boolean;
+  ad_label: string | null;
 };
 
 type ToolTrace = {
@@ -41,6 +45,54 @@ type ToolTrace = {
   arguments: string;
   status: "started" | "completed" | "failed";
   summary: string | null;
+};
+
+type PlanStepStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "blocked"
+  | "skipped";
+
+type PlanStep = {
+  step_id: string;
+  title: string;
+  objective: string;
+  kind: string | null;
+  depends_on: string[];
+  metadata: Record<string, unknown>;
+};
+
+type PlanState = {
+  plan: {
+    plan_id: string;
+    goal: string;
+    steps: PlanStep[];
+  };
+  status: "active" | "completed" | "blocked" | "cancelled";
+  current_step_id: string | null;
+  step_states: Array<{
+    step_id: string;
+    status: PlanStepStatus;
+    note: string | null;
+  }>;
+  summary: string;
+  next_action: string | null;
+  revision: number;
+  updated_at: string;
+};
+
+type OrderLink = {
+  order_id: string;
+  status:
+    | "pending_payment"
+    | "paid"
+    | "completed"
+    | "cancelled"
+    | "refunded";
+  total_cents: number;
+  preview_path: string;
+  ordered_at: string;
 };
 
 type ConversationSummary = {
@@ -60,6 +112,8 @@ type ConversationDetail = ConversationSummary & {
     created_at: string;
     recommendations: Product[];
     tool_trace: ToolTrace[];
+    plan_state: PlanState | null;
+    orders: OrderLink[];
   }>;
 };
 
@@ -70,6 +124,8 @@ type StreamEvent = {
     | "delta"
     | "tool_started"
     | "tool_completed"
+    | "plan_updated"
+    | "order_created"
     | "recommendations"
     | "done"
     | "error";
@@ -83,6 +139,9 @@ type StreamEvent = {
   arguments?: string;
   products?: Product[];
   tool_trace?: ToolTrace[];
+  plan_state?: PlanState | null;
+  order?: OrderLink;
+  orders?: OrderLink[];
 };
 
 const starters = [
@@ -114,6 +173,8 @@ function toMessages(conversation: ConversationDetail): Message[] {
     failed: message.status === "failed",
     products: message.recommendations,
     toolTrace: message.tool_trace,
+    planState: message.plan_state,
+    orders: message.orders,
   }));
 }
 
@@ -121,6 +182,45 @@ const priceFormatter = new Intl.NumberFormat("zh-CN", {
   style: "currency",
   currency: "CNY",
 });
+
+const toolLabels: Record<string, string> = {
+  update_plan: "更新 Plan",
+  get_agent_profile: "读取 Agent 画像",
+  get_platform_profile: "读取平台画像",
+  get_browse_history: "读取浏览记录",
+  get_order_history: "读取订单记录",
+  get_cart: "读取购物车",
+  get_product_recommendations: "获取商品推荐",
+  get_ad_recommendations: "获取广告推荐",
+  search_products: "搜索商品",
+  get_product: "查询详情",
+  submit_recommendations: "生成最终推荐",
+  create_order: "创建待支付订单",
+  get_order: "查询订单",
+};
+
+const planStatusLabels: Record<string, string> = {
+  pending: "待开始",
+  in_progress: "进行中",
+  completed: "已完成",
+  blocked: "已阻塞",
+  skipped: "已跳过",
+};
+
+const planOverallStatusLabels: Record<PlanState["status"], string> = {
+  active: "执行中",
+  completed: "已完成",
+  blocked: "已阻塞",
+  cancelled: "已取消",
+};
+
+const orderStatusLabels: Record<OrderLink["status"], string> = {
+  pending_payment: "待支付",
+  paid: "已支付",
+  completed: "已完成",
+  cancelled: "已取消",
+  refunded: "已退款",
+};
 
 function formatHistoryTime(value: string) {
   const date = new Date(value);
@@ -418,6 +518,36 @@ export function AgentChat() {
           );
         }
 
+        if (streamEvent.type === "plan_updated" && streamEvent.plan_state) {
+          setMessages((current) =>
+            current.map((item) =>
+              item.id === assistantId
+                ? { ...item, planState: streamEvent.plan_state }
+                : item,
+            ),
+          );
+        }
+
+        if (streamEvent.type === "order_created" && streamEvent.order) {
+          setMessages((current) =>
+            current.map((item) => {
+              if (item.id !== assistantId) {
+                return item;
+              }
+              const orders = item.orders ?? [];
+              return {
+                ...item,
+                orders: [
+                  ...orders.filter(
+                    (order) => order.order_id !== streamEvent.order?.order_id,
+                  ),
+                  streamEvent.order as OrderLink,
+                ],
+              };
+            }),
+          );
+        }
+
         if (streamEvent.type === "recommendations" && streamEvent.products) {
           setMessages((current) =>
             current.map((item) =>
@@ -449,6 +579,8 @@ export function AgentChat() {
                     ...item,
                     streaming: false,
                     toolTrace: streamEvent.tool_trace ?? item.toolTrace,
+                    planState: streamEvent.plan_state ?? item.planState,
+                    orders: streamEvent.orders ?? item.orders,
                   }
                 : item,
             ),
@@ -629,6 +761,75 @@ export function AgentChat() {
                         : "小牛"
                       : "你"}
                   </p>
+                  {item.planState ? (
+                    <section
+                      className={styles.planPanel}
+                      aria-label="Agent Plan State"
+                    >
+                      <header className={styles.planHeader}>
+                        <span>
+                          PLAN · R{item.planState.revision}
+                        </span>
+                        <b>
+                          {planOverallStatusLabels[item.planState.status] ??
+                            item.planState.status}
+                        </b>
+                      </header>
+                      <p className={styles.planGoal}>
+                        {item.planState.plan.goal}
+                      </p>
+                      <ol className={styles.planSteps}>
+                        {item.planState.plan.steps.map((step, stepIndex) => {
+                          const state = item.planState?.step_states.find(
+                            (candidate) => candidate.step_id === step.step_id,
+                          );
+                          const status = state?.status ?? "pending";
+                          const isCurrent =
+                            item.planState?.current_step_id === step.step_id;
+                          return (
+                            <li
+                              className={`${styles.planStep} ${
+                                isCurrent ? styles.planStepCurrent : ""
+                              } ${
+                                styles[
+                                  `planStep${status
+                                    .split("_")
+                                    .map(
+                                      (part) =>
+                                        part.charAt(0).toUpperCase() +
+                                        part.slice(1),
+                                    )
+                                    .join("")}` as keyof typeof styles
+                              ] ?? ""
+                              }`}
+                              key={step.step_id}
+                            >
+                              <span>{stepIndex + 1}</span>
+                              <div>
+                                <strong>{step.title}</strong>
+                                <small>{step.objective}</small>
+                                {state?.note ? <em>{state.note}</em> : null}
+                              </div>
+                              <b>
+                                {isCurrent ? "当前 · " : ""}
+                                {planStatusLabels[status] ?? status}
+                              </b>
+                            </li>
+                          );
+                        })}
+                      </ol>
+                      {item.planState.summary ? (
+                        <p className={styles.planSummary}>
+                          {item.planState.summary}
+                        </p>
+                      ) : null}
+                      {item.planState.next_action ? (
+                        <p className={styles.planNext}>
+                          下一步：{item.planState.next_action}
+                        </p>
+                      ) : null}
+                    </section>
+                  ) : null}
                   {item.toolTrace?.length ? (
                     <div className={styles.toolTrace} aria-label="Agent 工具调用">
                       {item.toolTrace.map((trace, traceIndex) => (
@@ -641,11 +842,8 @@ export function AgentChat() {
                           key={`${trace.call_id ?? trace.tool}-${traceIndex}`}
                         >
                           {trace.status === "completed" ? "✓" : "···"}
-                          {trace.tool === "search_products"
-                            ? " 搜索商品"
-                            : trace.tool === "get_product"
-                              ? " 查询详情"
-                              : ` ${trace.tool}`}
+                          {" "}
+                          {toolLabels[trace.tool] ?? trace.tool}
                         </span>
                       ))}
                     </div>
@@ -678,7 +876,14 @@ export function AgentChat() {
                         <article className={styles.productCard} key={product.id}>
                           <div className={styles.productTopline}>
                             <span>{product.category}</span>
-                            {product.badge ? <b>{product.badge}</b> : null}
+                            <span className={styles.productBadges}>
+                              {product.badge ? <b>{product.badge}</b> : null}
+                              {product.is_ad ? (
+                                <b className={styles.adBadge}>
+                                  {product.ad_label ?? "广告"}
+                                </b>
+                              ) : null}
+                            </span>
                           </div>
                           <h3>{product.name}</h3>
                           <p>{product.description}</p>
@@ -704,6 +909,36 @@ export function AgentChat() {
                             ))}
                           </div>
                         </article>
+                      ))}
+                    </div>
+                  ) : null}
+                  {item.orders?.length ? (
+                    <div className={styles.orderLinks}>
+                      {item.orders.map((order) => (
+                        <Link
+                          className={styles.orderLink}
+                          href={order.preview_path}
+                          key={order.order_id}
+                        >
+                          <span>
+                            <small>
+                              {order.status === "pending_payment"
+                                ? "待支付订单"
+                                : "订单"}
+                            </small>
+                            <strong>
+                              {priceFormatter.format(order.total_cents / 100)}
+                            </strong>
+                          </span>
+                          <span>
+                            <b>{orderStatusLabels[order.status]}</b>
+                            <em>
+                              {order.status === "pending_payment"
+                                ? "查看订单并支付 →"
+                                : "查看订单 →"}
+                            </em>
+                          </span>
+                        </Link>
                       ))}
                     </div>
                   ) : null}

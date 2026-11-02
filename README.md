@@ -10,12 +10,12 @@ web (Next.js :3000)
   ├── /api/products ──► mall-service (:8001)
   └── /api/chat ──────► agent-service (:8002)
                               ├── OpenAI Agents SDK
-                              └── Mock Mall tools
+                              └── HTTP ──► mall-service Mock APIs
 ```
 
-- `mall-service`：商城商品目录和 HTTP API。
+- `mall-service`：商城商品目录，以及浏览、订单、购物车、平台画像、商品推荐和广告的 Mock HTTP API。
 - `agent-service`：基于 OpenAI Agents SDK 的商城导购 Agent，通过工具调用
-  Mock 商城搜索和查询商品。
+  `mall-service`，并使用 Agent 本地维护的用户画像。
 - `web`：Next.js 商城页面，浏览器只访问同源的 Next.js API 路由。
 
 ## 启动
@@ -111,6 +111,15 @@ llm:
 - 商城健康检查：`GET http://localhost:8001/health`
 - 商品列表：`GET http://localhost:8001/api/products`
 - 商品详情：`GET http://localhost:8001/api/products/{product_id}`
+- 浏览记录：`GET http://localhost:8001/api/users/{user_id}/browse-history`
+- 订单记录：`GET http://localhost:8001/api/users/{user_id}/orders`
+- 创建待支付订单：`POST http://localhost:8001/api/users/{user_id}/orders`
+- 订单详情：`GET http://localhost:8001/api/users/{user_id}/orders/{order_id}`
+- 模拟支付：`POST http://localhost:8001/api/users/{user_id}/orders/{order_id}/pay`
+- 购物车：`GET http://localhost:8001/api/users/{user_id}/cart`
+- 平台画像：`GET http://localhost:8001/api/users/{user_id}/platform-profile`
+- 商品推荐：`POST http://localhost:8001/api/recommendations/products`
+- 广告推荐：`POST http://localhost:8001/api/recommendations/ads`
 - Agent 健康检查：`GET http://localhost:8002/health`
 - Agent 对话：`POST http://localhost:8002/api/chat`
 - Agent SSE 多轮对话：`POST http://localhost:8002/api/chat/stream`
@@ -131,9 +140,9 @@ pnpm --dir web build
 ```
 
 `/api/chat/stream` 使用 OpenAI Agents SDK 的 Chat Completions 模型适配器，
-支持自定义 `base_url` 和 API Key。Runner 会自动执行 ReAct 循环：模型选择
-`search_products` 或 `get_product`，Agent 执行 Mock 商城工具，然后把工具结果
-交回模型生成最终回复。`/api/chat` 暂时保留为商城首页使用的本地规则接口。
+支持自定义 `base_url` 和 API Key。Runner 会自动执行 ReAct 循环：模型自主选择
+用户记录、画像、商品推荐、广告和商品详情工具，然后把工具结果交回模型综合判断。
+`/api/chat` 暂时保留为商城首页使用的简单规则接口。
 
 独立对话页面：<http://localhost:3000/chat>。页面发送当前对话 ID 和新消息，
 后端从 SQLite 加载完整的多轮上下文。
@@ -150,16 +159,51 @@ pnpm --dir web build
 
 ## 推荐商品 Agent
 
-当前工具：
+当前固定演示用户为 `user_id = 1`。Agent 工具包括：
 
-- `search_products`：按关键词、分类、价格区间搜索商品。
-- `get_product`：按商品 ID 查询价格、库存和描述。
+- `update_plan`：由模型创建或整体替换 Plan 和 Plan State。
+- `get_agent_profile`：读取 Agent 自己维护的用户画像。
+- `get_platform_profile`：读取 `mall-service` 中的大数据/推荐平台画像。
+- `get_browse_history`、`get_order_history` 和 `get_cart`：读取用户行为。
+- `get_product_recommendations`：获取自然商品候选。
+- `get_ad_recommendations`：获取最多一个广告候选。
+- `search_products` 和 `get_product`：补充搜索及确认权威商品详情。
+- `create_order`：在用户明确确认购买后创建待支付订单。
+- `get_order`：查询当前用户的订单状态，但不能执行支付。
+- `submit_recommendations`：提交最多三个最终商品，服务端校验商品 ID、广告来源、
+  重复和库存。
 
-Mock 商城数据位于
-`agent-service/src/agent_service/mock_mall.py`。SSE 会额外发送
-`tool_started`、`tool_completed` 和 `recommendations` 事件。推荐商品卡片与工具
-轨迹会随助手消息保存，并在历史对话中恢复。
+推荐请求使用显式 Plan 驱动。Plan 的步骤、依赖、当前步骤、步骤状态、下一步以及
+是否继续、修订或替换计划全部由模型决定；代码只保存和回传 Plan State，不会自动
+推进步骤或根据工具调用推断状态。上一轮保存的 Plan State 会注入下一轮模型上下文，
+模型仍需自行决定如何使用它。Plan State 通过 SSE 的 `plan_updated` 事件实时更新，
+并随助手消息保存到 SQLite。
 
-每个 Agent 请求最多执行 `max_turns` 个模型/工具回合，单个工具默认超时 8 秒。
+所有记录和广告 Mock 数据均位于 `mall-service`。最终候选最多三个，其中最多一个
+广告；广告由服务端添加“广告”标识。没有合格商品时，Agent 会建议用户去其他平台
+购买。SSE 会发送 `tool_started`、`tool_completed` 和 `recommendations` 事件。
+最终推荐商品卡片、广告标识、Plan State 与工具轨迹会随助手消息保存，并在历史
+对话中恢复。
+
+## 购买与订单预览
+
+推荐只负责候选商品，不会自动下单。只有用户在对话中明确确认购买并确定购买对象
+后，模型才会调用 `create_order`。服务端重新读取商品权威价格和库存，生成待支付
+订单及商品快照；相同幂等请求返回同一笔订单。
+
+订单创建成功后，SSE 会发送 `order_created`，聊天页面展示“查看订单并支付”入口。
+订单预览页地址为：
+
+```text
+http://localhost:3000/orders/{order_id}
+```
+
+预览页展示商品、Mock 收货地址、运费和应付金额。用户点击“模拟支付”后，订单通过
+`pending_payment → paid` 状态变化完成手动支付。重复支付已支付订单不会重复扣减
+库存。当前不接入真实支付渠道，订单存储也是 `mall-service` 进程内的 Mock 仓库。
+本次未接入的复杂购买决策因素记录在根目录的 `TODO.md`。
+
+推荐流程会依次加载画像、行为、商品和广告，并提交最终结果。`max_turns` 默认值和
+最小值为 10，最大值为 100；单个工具默认超时 8 秒。
 Agents SDK 的远程 tracing 已关闭，以避免把 DeepSeek 对话发送到 OpenAI tracing
 服务。

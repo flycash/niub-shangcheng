@@ -9,6 +9,8 @@ from uuid import uuid4
 from .models import (
     ConversationDetail,
     ConversationSummary,
+    OrderLink,
+    PlanState,
     Product,
     StoredMessage,
     ToolTrace,
@@ -281,6 +283,17 @@ class ConversationStore:
             for trace in metadata.get("tool_trace", [])
             if isinstance(trace, dict)
         ]
+        plan_state: PlanState | None = None
+        if isinstance(metadata.get("plan_state"), dict):
+            try:
+                plan_state = PlanState.model_validate(metadata["plan_state"])
+            except ValueError:
+                plan_state = None
+        orders = [
+            OrderLink.model_validate(order)
+            for order in metadata.get("orders", [])
+            if isinstance(order, dict)
+        ]
         return StoredMessage(
             id=row["id"],
             role=row["role"],
@@ -289,6 +302,8 @@ class ConversationStore:
             created_at=row["created_at"],
             recommendations=recommendations,
             tool_trace=tool_trace,
+            plan_state=plan_state,
+            orders=orders,
         )
 
 
