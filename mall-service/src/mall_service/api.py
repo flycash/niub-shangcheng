@@ -43,7 +43,7 @@ def list_products(
     category: Annotated[str | None, Query(max_length=50)] = None,
     max_price_cents: Annotated[int | None, Query(ge=0)] = None,
     min_price_cents: Annotated[int | None, Query(ge=0)] = None,
-    limit: Annotated[int, Query(ge=1, le=5)] = 5,
+    limit: Annotated[int, Query(ge=1, le=10)] = 5,
 ) -> ProductList:
     products = search_products(
         q,

@@ -1,6 +1,5 @@
 import asyncio
 import json
-from pathlib import Path
 
 import httpx
 from agents.testing import ScriptedModel, assistant_message, function_call
@@ -15,12 +14,22 @@ from agent_service.agent_runner import (
 )
 from agent_service.llm_config import LLMConfig
 from agent_service.mall_client import MallClient
-from agent_service.models import ConversationMessage, PlanState, Product
-
-PROMPT_PATH = (
-    Path(__file__).resolve().parents[1] / "prompts" / "shopping_agent.md"
+from agent_service.models import (
+    AdInfo,
+    ConversationMessage,
+    PlanState,
+    Product,
+    RecommendationBatch,
+    RecommendationDemand,
+    ScoredProduct,
+    SemanticRankingItem,
+    SemanticRankingResult,
+    SourceEvidence,
 )
-
+from agent_service.recommendation_reranker import (
+    AgentSemanticReranker,
+    semantic_candidates,
+)
 
 def llm_config() -> LLMConfig:
     return LLMConfig(
@@ -28,7 +37,6 @@ def llm_config() -> LLMConfig:
         api_key="test-key",
         model="deepseek-flash",
         max_turns=10,
-        prompt_file=str(PROMPT_PATH),
     )
 
 
@@ -131,6 +139,76 @@ def invoke_tool(context: ShoppingAgentContext, name: str, arguments: dict):
 class UnavailableMall:
     async def get_browse_history(self, user_id: int, limit: int = 10):
         raise RuntimeError("mall unavailable")
+
+
+class StaticSemanticReranker:
+    def __init__(self, result: SemanticRankingResult) -> None:
+        self.result = result
+        self.environment_context: str | None = None
+
+    async def rerank(
+        self,
+        *,
+        batch: RecommendationBatch,
+        user_request: str,
+        environment_context: str | None = None,
+    ) -> SemanticRankingResult:
+        self.environment_context = environment_context
+        return self.result
+
+
+def scored_candidate(
+    *,
+    product_id: str,
+    channel: str,
+    score: float,
+    ad: AdInfo | None = None,
+) -> ScoredProduct:
+    product = Product(
+        id=product_id,
+        name=product_id,
+        description="",
+        price_cents=1000,
+        category="箱包",
+        stock=10,
+        is_ad=ad is not None,
+        ad_label="广告" if ad is not None else None,
+    )
+    return ScoredProduct(
+        product=product,
+        channel=channel,
+        score=score,
+        confidence="high",
+        evidence=[
+            SourceEvidence(
+                source="need",
+                signal_score=1,
+                weighted_points=45,
+                reason="符合当前需求",
+            )
+        ],
+        ad=ad,
+    )
+
+
+def recommendation_batch(
+    *,
+    organic: list[ScoredProduct],
+    ads: list[ScoredProduct],
+    ad_only: bool = False,
+    cutoff: float | None = None,
+) -> RecommendationBatch:
+    return RecommendationBatch(
+        demand=RecommendationDemand(query="通勤"),
+        organic_candidates=organic,
+        ad_candidates=ads,
+        cutoff_score=cutoff,
+        competitive_ads=ads,
+        requires_semantic_ranking=bool(ads),
+        ad_only=ad_only,
+        source_statuses={"cart": "ok_with_data"},
+        generated_at="2026-11-03T00:00:00+00:00",
+    )
 
 
 def test_normalize_openai_base_url() -> None:
@@ -244,7 +322,7 @@ def test_recommendation_and_ad_tools_register_candidates() -> None:
         item["product"]["id"] in context.organic_product_ids
         for item in products
     )
-    assert len(ads) <= 1
+    assert len(ads) <= 10
     assert all(
         item["product"]["id"] in context.ad_product_ids for item in ads
     )
@@ -271,8 +349,8 @@ def test_create_order_tool_creates_pending_order_and_returns_preview() -> None:
     context = ShoppingAgentContext(mall=mall_client(), turn_id="turn-order")
     invoke_tool(
         context,
-        "get_product_recommendations",
-        {"query": "通勤", "limit": 3},
+        "recommend_products",
+        {"query": "通勤", "max_price_cents": 30000},
     )
 
     created = json.loads(
@@ -320,90 +398,271 @@ def test_create_order_rejects_product_outside_known_recommendations() -> None:
     assert result["status"] == "rejected"
 
 
-def test_submit_recommendations_enforces_limits_and_ad_source() -> None:
-    context = ShoppingAgentContext(mall=mall_client())
-    product_result = json.loads(
+def test_recommend_products_formula_path_selects_top_two() -> None:
+    context = ShoppingAgentContext(mall=mall_client(), user_id=999)
+
+    result = json.loads(
         invoke_tool(
             context,
-            "get_product_recommendations",
-            {"query": "通勤", "limit": 3},
+            "recommend_products",
+            {"query": "家居"},
         )
     )
-    ad_result = json.loads(
-        invoke_tool(context, "get_ad_recommendations", {"query": "通勤"})
+
+    assert result["status"] == "accepted"
+    assert context.recommendation_batch is not None
+    assert context.recommendation_batch.requires_semantic_ranking is False
+    assert len(context.selected_products) == 2
+    assert all(
+        product.is_ad is False
+        for product in context.selected_products.values()
     )
 
-    organic_id = product_result[0]["product"]["id"]
-    ad_id = ad_result[0]["product"]["id"]
+
+def test_recommend_products_returns_no_match_without_eligible_candidates() -> None:
+    context = ShoppingAgentContext(mall=mall_client(), user_id=999)
+
+    result = json.loads(
+        invoke_tool(
+            context,
+            "recommend_products",
+            {"query": "宠物用品"},
+        )
+    )
+
+    assert result["status"] == "no_match"
+    assert context.submitted is True
+    assert context.selected_products == {}
+
+
+def test_semantic_reranker_selects_organic_before_ad() -> None:
+    context = ShoppingAgentContext(mall=mall_client())
+    organic = scored_candidate(
+        product_id="commuter-backpack",
+        channel="organic",
+        score=70,
+    )
+    ad = scored_candidate(
+        product_id="portable-coffee",
+        channel="ad",
+        score=74,
+        ad=AdInfo(ad_id="ad-1001", campaign_id="campaign-autumn-2026"),
+    )
+    reranker = StaticSemanticReranker(
+        SemanticRankingResult(
+            items=[
+                SemanticRankingItem(
+                    product_id="commuter-backpack",
+                    channel="organic",
+                    reason="更符合通勤用途",
+                ),
+                SemanticRankingItem(
+                    product_id="portable-coffee",
+                    channel="ad",
+                    reason="补充办公室饮用场景",
+                ),
+            ],
+            summary="自然商品优先，广告作为补充",
+        )
+    )
+    context.semantic_reranker = reranker
+    context.recommendation_batch = recommendation_batch(
+        organic=[organic],
+        ads=[ad],
+        cutoff=60,
+    )
+
     accepted = json.loads(
         invoke_tool(
             context,
-            "submit_recommendations",
-            {
-                "items": [
-                    {
-                        "product_id": organic_id,
-                        "source": "organic",
-                        "reason": "符合通勤需求",
-                    },
-                    {
-                        "product_id": ad_id,
-                        "source": "ad",
-                        "reason": "广告候选也符合通勤需求",
-                    },
-                ]
-            },
-        )
-    )
-    too_many = json.loads(
-        invoke_tool(
-            context,
-            "submit_recommendations",
-            {
-                "items": [
-                    {
-                        "product_id": organic_id,
-                        "source": "organic",
-                        "reason": "理由一",
-                    },
-                    {
-                        "product_id": organic_id,
-                        "source": "organic",
-                        "reason": "理由二",
-                    },
-                    {
-                        "product_id": organic_id,
-                        "source": "organic",
-                        "reason": "理由三",
-                    },
-                    {
-                        "product_id": organic_id,
-                        "source": "organic",
-                        "reason": "理由四",
-                    },
-                ]
-            },
+            "rerank_recommendations",
+            {"environment_context": "明早通勤，需要轻便"},
         )
     )
 
     assert accepted["status"] == "accepted"
     assert len(context.selected_products) == 2
-    assert context.selected_products[ad_id].is_ad is True
-    assert context.selected_products[ad_id].ad_label == "广告"
-    assert too_many["status"] == "rejected"
+    assert list(context.selected_products) == [
+        "commuter-backpack",
+        "portable-coffee",
+    ]
+    assert context.selected_products["portable-coffee"].is_ad is True
+    assert context.selected_products["portable-coffee"].ad_label == "广告"
+    assert reranker.environment_context == "明早通勤，需要轻便"
 
-    no_match = json.loads(
-        invoke_tool(
-            context,
-            "submit_recommendations",
-            {
-                "items": [],
-                "no_match_reason": "当前商城没有合适商品",
-            },
+
+def test_semantic_reranker_falls_back_when_ad_is_first() -> None:
+    context = ShoppingAgentContext(mall=mall_client())
+    organic = scored_candidate(
+        product_id="commuter-backpack",
+        channel="organic",
+        score=70,
+    )
+    ad = scored_candidate(
+        product_id="portable-coffee",
+        channel="ad",
+        score=74,
+        ad=AdInfo(ad_id="ad-1001", campaign_id="campaign-autumn-2026"),
+    )
+    context.semantic_reranker = StaticSemanticReranker(
+        SemanticRankingResult(
+            items=[
+                SemanticRankingItem(
+                    product_id="portable-coffee",
+                    channel="ad",
+                    reason="分数更高",
+                ),
+                SemanticRankingItem(
+                    product_id="commuter-backpack",
+                    channel="organic",
+                    reason="符合通勤需求",
+                ),
+            ]
         )
     )
-    assert no_match["status"] == "accepted"
-    assert context.selected_products == {}
+    context.recommendation_batch = recommendation_batch(
+        organic=[organic],
+        ads=[ad],
+        cutoff=60,
+    )
+
+    result = json.loads(
+        invoke_tool(
+            context,
+            "rerank_recommendations",
+            {},
+        )
+    )
+
+    assert result["status"] == "fallback"
+    assert "cannot be first" in result["fallback_reason"]
+    assert list(context.selected_products) == ["commuter-backpack"]
+
+
+def test_semantic_reranker_allows_ad_only_when_no_organic_candidate() -> None:
+    context = ShoppingAgentContext(mall=mall_client())
+    ad = scored_candidate(
+        product_id="portable-coffee",
+        channel="ad",
+        score=74,
+        ad=AdInfo(ad_id="ad-1001", campaign_id="campaign-autumn-2026"),
+    )
+    context.semantic_reranker = StaticSemanticReranker(
+        SemanticRankingResult(
+            items=[
+                SemanticRankingItem(
+                    product_id="portable-coffee",
+                    channel="ad",
+                    reason="当前唯一符合需求的候选",
+                )
+            ]
+        )
+    )
+    context.recommendation_batch = recommendation_batch(
+        organic=[],
+        ads=[ad],
+        ad_only=True,
+    )
+
+    result = json.loads(
+        invoke_tool(context, "rerank_recommendations", {})
+    )
+
+    assert result["status"] == "accepted"
+    assert list(context.selected_products) == ["portable-coffee"]
+    assert context.selected_products["portable-coffee"].is_ad is True
+
+
+def test_semantic_reranker_agent_uses_independent_prompt() -> None:
+    organic = scored_candidate(
+        product_id="commuter-backpack",
+        channel="organic",
+        score=70,
+    )
+    ad = scored_candidate(
+        product_id="portable-coffee",
+        channel="ad",
+        score=74,
+        ad=AdInfo(ad_id="ad-1001", campaign_id="campaign-autumn-2026"),
+    )
+    batch = recommendation_batch(
+        organic=[organic],
+        ads=[ad],
+        cutoff=60,
+    )
+    model = ScriptedModel(
+        [
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "product_id": "commuter-backpack",
+                                    "channel": "organic",
+                                    "reason": "首选自然商品",
+                                },
+                                {
+                                    "product_id": "portable-coffee",
+                                    "channel": "ad",
+                                    "reason": "补充办公室场景",
+                                },
+                            ],
+                            "summary": "自然商品优先",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ]
+        ]
+    )
+    reranker = AgentSemanticReranker(
+        config=llm_config(),
+        model=model,
+    )
+
+    ranking = asyncio.run(
+        reranker.rerank(
+            batch=batch,
+            user_request="推荐通勤好物",
+            environment_context="明早有雨",
+        )
+    )
+
+    assert [item.product_id for item in ranking.items] == [
+        "commuter-backpack",
+        "portable-coffee",
+    ]
+    assert model.first_call is not None
+    assert "商品推荐语义终排器" in (
+        model.first_call.system_instructions or ""
+    )
+
+
+def test_semantic_candidates_are_one_mixed_score_ordered_pool() -> None:
+    organic = scored_candidate(
+        product_id="commuter-backpack",
+        channel="organic",
+        score=70,
+    )
+    ad = scored_candidate(
+        product_id="portable-coffee",
+        channel="ad",
+        score=76,
+        ad=AdInfo(ad_id="ad-1001", campaign_id="campaign-autumn-2026"),
+    )
+    batch = recommendation_batch(
+        organic=[organic],
+        ads=[ad],
+        cutoff=60,
+    )
+
+    candidates = semantic_candidates(batch)
+
+    assert [(item.product.id, item.channel) for item in candidates] == [
+        ("portable-coffee", "ad"),
+        ("commuter-backpack", "organic"),
+    ]
 
 
 def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
@@ -415,40 +674,39 @@ def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
                     plan_arguments(),
                     call_id="call-plan",
                 ),
-                function_call("get_agent_profile", {}, call_id="call-agent"),
-                function_call("get_platform_profile", {}, call_id="call-platform"),
-                function_call("get_browse_history", {}, call_id="call-browse"),
-                function_call("get_order_history", {}, call_id="call-orders"),
-                function_call("get_cart", {}, call_id="call-cart"),
                 function_call(
-                    "get_product_recommendations",
-                    {"query": "通勤", "max_price_cents": 30000, "limit": 3},
-                    call_id="call-products",
-                ),
-                function_call(
-                    "get_ad_recommendations",
+                    "recommend_products",
                     {"query": "通勤", "max_price_cents": 30000},
-                    call_id="call-ads",
+                    call_id="call-recommend",
                 ),
             ],
             [
                 function_call(
-                    "submit_recommendations",
-                    {
-                        "items": [
-                            {
-                                "product_id": "commuter-backpack",
-                                "source": "organic",
-                                "reason": "通勤实用且符合预算",
-                            },
-                            {
-                                "product_id": "portable-coffee",
-                                "source": "ad",
-                                "reason": "轻便，也可作为通勤礼物",
-                            },
-                        ]
-                    },
-                    call_id="call-submit",
+                    "rerank_recommendations",
+                    {"environment_context": "明早需要通勤"},
+                    call_id="call-rerank",
+                )
+            ],
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "product_id": "commuter-backpack",
+                                    "channel": "organic",
+                                    "reason": "通勤容量和电脑夹层更合适",
+                                },
+                                {
+                                    "product_id": "travel-bottle",
+                                    "channel": "ad",
+                                    "reason": "补充通勤饮水场景",
+                                },
+                            ],
+                            "summary": "自然商品优先，广告补充",
+                        },
+                        ensure_ascii=False,
+                    )
                 )
             ],
             [assistant_message("我综合你的记录，推荐这两件商品。")],
@@ -482,23 +740,19 @@ def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
     )
     assert [product["id"] for product in recommendations] == [
         "commuter-backpack",
-        "portable-coffee",
+        "travel-bottle",
     ]
     assert recommendations[1]["is_ad"] is True
-    assert recommendations[1]["ad_label"] == "广告"
-    plan_state = next(
-        event["plan_state"]
-        for event in events
-        if event["type"] == "done"
-    )
+    done = next(event for event in events if event["type"] == "done")
+    plan_state = done["plan_state"]
     assert plan_state["current_step_id"] == "collect"
     assert plan_state["step_states"][0]["status"] == "in_progress"
     assert plan_state["revision"] == 1
     assert model.last_call is not None
-    assert len(model.last_call.tools) == 13
+    assert len(model.last_call.tools) == 14
     assert model.first_call is not None
     assert "小牛导购" in (model.first_call.system_instructions or "")
-    assert "最终推荐最多三个" in (
+    assert "独立语义终排" in (
         model.first_call.system_instructions or ""
     )
 

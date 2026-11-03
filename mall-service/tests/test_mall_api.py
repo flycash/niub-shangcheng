@@ -104,7 +104,7 @@ def test_product_and_ad_recommendations() -> None:
     assert all(item["source"] == "product_recommendation" for item in products)
     assert ad_response.status_code == 200
     ads = ad_response.json()["items"]
-    assert len(ads) <= 1
+    assert 0 < len(ads) <= 10
     if ads:
         assert ads[0]["source"] == "advertisement"
         assert ads[0]["ad"]["is_ad"] is True

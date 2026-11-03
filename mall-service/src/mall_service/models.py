@@ -145,7 +145,7 @@ class ProductRecommendationRequest(BaseModel):
     category: str | None = Field(default=None, max_length=50)
     min_price_cents: int | None = Field(default=None, ge=0)
     max_price_cents: int | None = Field(default=None, ge=0)
-    limit: int = Field(default=5, ge=1, le=5)
+    limit: int = Field(default=5, ge=1, le=10)
 
 
 class AdRecommendationRequest(BaseModel):
@@ -153,3 +153,4 @@ class AdRecommendationRequest(BaseModel):
     query: str = Field(default="", max_length=200)
     category: str | None = Field(default=None, max_length=50)
     max_price_cents: int | None = Field(default=None, ge=0)
+    limit: int = Field(default=10, ge=1, le=10)

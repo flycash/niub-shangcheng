@@ -193,6 +193,11 @@ async def persisted_agent_stream(
                         if isinstance(order_payload, dict):
                             order = OrderLink.model_validate(order_payload)
                             created_orders[order.order_id] = order
+                if isinstance(event.get("recommendations"), list):
+                    for product_payload in event["recommendations"]:
+                        if isinstance(product_payload, dict):
+                            product = Product.model_validate(product_payload)
+                            recommendations[product.id] = product
                 store.finish_message(
                     assistant_message_id,
                     "".join(content_parts) or error_message,
@@ -218,6 +223,11 @@ async def persisted_agent_stream(
                         if isinstance(order_payload, dict):
                             order = OrderLink.model_validate(order_payload)
                             created_orders[order.order_id] = order
+                if isinstance(event.get("recommendations"), list):
+                    for product_payload in event["recommendations"]:
+                        if isinstance(product_payload, dict):
+                            product = Product.model_validate(product_payload)
+                            recommendations[product.id] = product
                 store.finish_message(
                     assistant_message_id,
                     "".join(content_parts),

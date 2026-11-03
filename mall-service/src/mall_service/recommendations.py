@@ -73,7 +73,7 @@ def recommend_products(
         category=request.category,
         max_price_cents=request.max_price_cents,
         min_price_cents=request.min_price_cents,
-        limit=5,
+        limit=request.limit,
     )
     scores = _recommend_scores(request.user_id)
     candidates = [
@@ -96,11 +96,10 @@ def recommend_ads(request: AdRecommendationRequest) -> list[ProductCandidate]:
         query=request.query,
         category=request.category,
         max_price_cents=request.max_price_cents,
-        limit=1,
+        limit=request.limit,
     )
     if not products:
         return []
-    product = products[0]
     return [
         ProductCandidate(
             product=product,
@@ -112,4 +111,5 @@ def recommend_ads(request: AdRecommendationRequest) -> list[ProductCandidate]:
                 campaign_id="campaign-autumn-2026",
             ),
         )
+        for product in products
     ]

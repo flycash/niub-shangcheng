@@ -90,21 +90,14 @@ Agent 提示词保存在：
 
 ```text
 agent-service/prompts/shopping_agent.md
+agent-service/prompts/recommendation_reranker.md
 ```
 
-YAML 只配置提示词文件路径：
-
-```yaml
-llm:
-  prompt_file: "../prompts/shopping_agent.md"
-```
-
-相对路径以 `llm.yaml` 所在目录为基准，也可以填写绝对路径。提示词在每次 Agent
-请求开始时重新读取，因此修改 Markdown 后下一轮对话立即生效，不需要重启服务。
-
-提示词文件限制为 UTF-8、内容非空且不超过 64 KiB。旧的
-`system_prompt` 配置暂时兼容，但会产生弃用警告；配置了 `prompt_file` 时优先
-使用文件内容。
+主 Agent 和语义终排 Agent 各自在所属模块中声明 Prompt 路径，并通过
+[`prompt_loader.py`](agent-service/src/agent_service/prompt_loader.py)
+提供的通用 `load_prompt(path)` 读取文件。YAML 不保存 Prompt 路径。提示词在每次
+请求时重新读取，因此修改 Markdown 后下一轮对话立即生效，不需要重启服务。提示词
+文件限制为 UTF-8、内容非空且不超过 64 KiB。
 
 ## 服务接口
 
@@ -162,16 +155,18 @@ pnpm --dir web build
 当前固定演示用户为 `user_id = 1`。Agent 工具包括：
 
 - `update_plan`：由模型创建或整体替换 Plan 和 Plan State。
+- `recommend_products`：并行读取画像、浏览、订单、购物车和两路候选，按统一
+  公式生成自然商品 Top 10 与广告 Top 3，并执行阈值分路。
+- `rerank_recommendations`：独立的语义终排工具，使用单独 Prompt 综合公式分数、
+  商品语义和可信环境信息，最多选择两个自然商品和一个广告商品。
 - `get_agent_profile`：读取 Agent 自己维护的用户画像。
 - `get_platform_profile`：读取 `mall-service` 中的大数据/推荐平台画像。
 - `get_browse_history`、`get_order_history` 和 `get_cart`：读取用户行为。
 - `get_product_recommendations`：获取自然商品候选。
-- `get_ad_recommendations`：获取最多一个广告候选。
+- `get_ad_recommendations`：获取广告候选池，公式评分后由推荐流程截取 Top 3。
 - `search_products` 和 `get_product`：补充搜索及确认权威商品详情。
 - `create_order`：在用户明确确认购买后创建待支付订单。
 - `get_order`：查询当前用户的订单状态，但不能执行支付。
-- `submit_recommendations`：提交最多三个最终商品，服务端校验商品 ID、广告来源、
-  重复和库存。
 
 推荐请求使用显式 Plan 驱动。Plan 的步骤、依赖、当前步骤、步骤状态、下一步以及
 是否继续、修订或替换计划全部由模型决定；代码只保存和回传 Plan State，不会自动
@@ -179,11 +174,14 @@ pnpm --dir web build
 模型仍需自行决定如何使用它。Plan State 通过 SSE 的 `plan_updated` 事件实时更新，
 并随助手消息保存到 SQLite。
 
-所有记录和广告 Mock 数据均位于 `mall-service`。最终候选最多三个，其中最多一个
-广告；广告由服务端添加“广告”标识。没有合格商品时，Agent 会建议用户去其他平台
-购买。SSE 会发送 `tool_started`、`tool_completed` 和 `recommendations` 事件。
-最终推荐商品卡片、广告标识、Plan State 与工具轨迹会随助手消息保存，并在历史
-对话中恢复。
+所有记录和广告 Mock 数据均位于 `mall-service`。自然推荐和广告分别使用统一公式
+评分；广告最高分严格高于自然 Top 10 最低分时，最多三个达标广告与自然候选一起
+进入独立语义终排。最终最多两个自然商品和一个广告，存在自然商品时广告不能排在
+第一位；只有自然候选为空时才允许广告单独出现。广告由服务端添加“广告”标识。
+没有合格商品时，Agent 会建议用户去其他平台购买。SSE 会发送 `tool_started`、
+`tool_completed`、`recommendations`、`delta` 和 `done` 事件。终排完成后，工具
+结果会返回主 Agent，由主 Agent 继续生成最终文字回答，并在文字后展示可点击的
+商品卡片。推荐商品同时作为内部元数据保存，以支持“第一个商品”等后续指代和下单。
 
 ## 购买与订单预览
 
@@ -203,7 +201,11 @@ http://localhost:3000/orders/{order_id}
 库存。当前不接入真实支付渠道，订单存储也是 `mall-service` 进程内的 Mock 仓库。
 本次未接入的复杂购买决策因素记录在根目录的 `TODO.md`。
 
-推荐流程会依次加载画像、行为、商品和广告，并提交最终结果。`max_turns` 默认值和
-最小值为 10，最大值为 100；单个工具默认超时 8 秒。
+推荐流程由 `recommend_products` 统一加载画像、行为、商品和广告，阈值命中后再由
+`rerank_recommendations` 完成语义终排。`max_turns` 默认值和最小值为 10，
+最大值为 100；模型请求和单个工具默认超时均为 30 分钟。主 Agent 和终排 Agent
+的运行时输出预算最低为 32768 token，Prompt 文件上限为 1 MiB，单条对话消息上限
+为 100000 字符，避免较小的配置导致工具调用、最终回答或长上下文被截断。
+如果语义终排暂时失败，工具会退回公式排序结果，主 Agent 仍可继续生成回答。
 Agents SDK 的远程 tracing 已关闭，以避免把 DeepSeek 对话发送到 OpenAI tracing
 服务。

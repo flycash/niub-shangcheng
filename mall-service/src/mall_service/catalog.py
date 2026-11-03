@@ -162,4 +162,4 @@ def search_products(
 
     if terms:
         candidates.sort(key=lambda item: (-item[0], item[1].price_cents))
-    return [product for _, product in candidates[: max(1, min(limit, 5))]]
+    return [product for _, product in candidates[: max(1, min(limit, 10))]]

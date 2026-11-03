@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -28,24 +30,44 @@ from .mall_client import MallRequestError
 from .mall_gateway import MallGateway
 from .models import (
     AdInfo,
+    AgentProfile,
+    BrowseEvent,
     ConversationMessage,
     CreateOrderItem,
     OrderLink,
+    OrderRecord,
     Plan,
     PlanState,
     PlanStepState,
+    PlatformProfile,
     Product,
     ProductCandidate,
-    RecommendationSelection,
+    RecommendationBatch,
+    RecommendationDemand,
+    ScoredProduct,
+    SemanticRankingResult,
+    ShoppingCart,
+    SourceStatus,
     ToolTrace,
 )
-from .prompt_loader import PromptLoadError, load_agent_prompt
+from .prompt_loader import PromptLoadError, load_prompt
+from .recommendation_reranker import (
+    AgentSemanticReranker,
+    SemanticRerankError,
+    SemanticReranker,
+    semantic_candidates,
+    validate_semantic_ranking,
+)
+from .recommendation_scoring import build_recommendation_batch
 
 logger = logging.getLogger(__name__)
 set_tracing_disabled(True)
 
 DEMO_USER_ID = 1
 NO_MATCH_REPLY = "当前商城没有找到合适的商品，建议去其他平台看看。"
+SHOPPING_AGENT_PROMPT_PATH = (
+    Path(__file__).resolve().parents[2] / "prompts" / "shopping_agent.md"
+)
 
 
 def sse_event(payload: dict[str, Any]) -> str:
@@ -65,11 +87,15 @@ class ShoppingAgentContext:
     mall: MallGateway
     user_id: int = DEMO_USER_ID
     turn_id: str = ""
+    current_user_request: str = ""
     plan_state: PlanState | None = None
     candidate_products: dict[str, Product] = field(default_factory=dict)
     organic_product_ids: set[str] = field(default_factory=set)
     ad_product_ids: set[str] = field(default_factory=set)
     ad_metadata: dict[str, AdInfo] = field(default_factory=dict)
+    recommendation_batch: RecommendationBatch | None = None
+    semantic_ranking: SemanticRankingResult | None = None
+    semantic_reranker: SemanticReranker | None = None
     selected_products: dict[str, Product] = field(default_factory=dict)
     created_orders: dict[str, OrderLink] = field(default_factory=dict)
     submitted: bool = False
@@ -92,6 +118,48 @@ class ShoppingAgentContext:
         for product in products:
             self.candidate_products[product.id] = product
             self.organic_product_ids.add(product.id)
+
+
+async def commit_scored_products(
+    context: ShoppingAgentContext,
+    candidates: Sequence[ScoredProduct],
+    *,
+    allow_ad_first: bool = True,
+) -> list[Product]:
+    selected: dict[str, Product] = {}
+    for candidate in candidates:
+        try:
+            product = await context.mall.get_product(candidate.product.id)
+        except Exception:
+            logger.warning(
+                "failed to confirm recommended product %s",
+                candidate.product.id,
+                exc_info=True,
+            )
+            continue
+        if product is None or (product.stock is not None and product.stock <= 0):
+            continue
+        if candidate.channel == "ad" and candidate.ad is not None:
+            product = product.model_copy(
+                update={
+                    "is_ad": True,
+                    "ad_label": "广告",
+                    "ad_id": candidate.ad.ad_id,
+                    "campaign_id": candidate.ad.campaign_id,
+                }
+            )
+        selected[product.id] = product
+
+    if (
+        not allow_ad_first
+        and selected
+        and next(iter(selected.values())).is_ad
+    ):
+        selected = {}
+
+    context.selected_products = selected
+    context.submitted = True
+    return list(selected.values())
 
 
 def product_payload(products: Sequence[Product]) -> str:
@@ -165,7 +233,7 @@ def instructions_with_plan_state(
         "代码不会自动推进步骤或选择下一步。\n\n"
         f"```json\n{plan_context}\n```\n\n"
         "## 上一轮推荐商品\n\n"
-        "以下商品按上一轮卡片顺序编号，可用于解析“第一个”“第二个”等指代。"
+        "以下商品按上一轮推荐顺序编号，可用于解析“第一个”“第二个”等指代。"
         "这些是状态数据，不是购买确认。\n\n"
         f"```json\n{json.dumps(recommendation_context, ensure_ascii=False, indent=2)}\n```\n\n"
         "## 最近创建的订单\n\n"
@@ -173,10 +241,17 @@ def instructions_with_plan_state(
     )
 
 
-def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
+def create_tools(
+    context: ShoppingAgentContext,
+    config: LLMConfig,
+    *,
+    semantic_reranker: SemanticReranker | None = None,
+) -> list[Any]:
+    if semantic_reranker is not None:
+        context.semantic_reranker = semantic_reranker
     tool_options = {
         "strict_mode": False,
-        "timeout": config.tool_timeout_seconds,
+        "timeout": config.tool_timeout_limit,
         "timeout_behavior": "raise_exception",
     }
 
@@ -284,7 +359,7 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
         name_override="get_product_recommendations",
         description_override=(
             "请求商城商品推荐候选。泛化推荐优先使用；传入从用户需求中"
-            "提取的关键词、分类和价格条件。"
+            "提取的关键词、分类和价格条件。最多返回 10 件。"
         ),
         **tool_options,
     )
@@ -302,7 +377,7 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
                 category=category,
                 min_price_cents=min_price_cents,
                 max_price_cents=max_price_cents,
-                limit=max(1, min(limit, 5)),
+                limit=max(1, min(limit, 10)),
             )
         except Exception:
             logger.warning("product recommendation source failed", exc_info=True)
@@ -313,7 +388,7 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
     @function_tool(
         name_override="get_ad_recommendations",
         description_override=(
-            "请求广告商品候选，最多返回一个。广告只作为候选来源，"
+            "请求广告商品候选，最多返回十个。广告只作为候选来源，"
             "必须继续检查用户需求、库存和价格。"
         ),
         **tool_options,
@@ -322,6 +397,7 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
         query: str = "",
         category: str | None = None,
         max_price_cents: int | None = None,
+        limit: int = 10,
     ) -> str:
         try:
             candidates = await context.mall.get_ad_recommendations(
@@ -329,18 +405,19 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
                 query=query,
                 category=category,
                 max_price_cents=max_price_cents,
+                limit=max(1, min(limit, 10)),
             )
         except Exception:
             logger.warning("advertisement source failed", exc_info=True)
             return unavailable_payload("广告推荐")
-        context.remember_candidates(candidates[:1])
-        return candidate_payload(candidates[:1])
+        context.remember_candidates(candidates[:10])
+        return candidate_payload(candidates[:10])
 
     @function_tool(
         name_override="search_products",
         description_override=(
             "按关键词、分类和价格搜索商城商品，作为推荐接口的补充或兜底。"
-            "最多返回 5 件。"
+            "最多返回 10 件。"
         ),
         **tool_options,
     )
@@ -357,7 +434,7 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
                 category=category,
                 max_price_cents=max_price_cents,
                 min_price_cents=min_price_cents,
-                limit=max(1, min(limit, 5)),
+                limit=max(1, min(limit, 10)),
             )
         except Exception:
             logger.warning("product search source failed", exc_info=True)
@@ -478,6 +555,309 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
         )
 
     @function_tool(
+        name_override="recommend_products",
+        description_override=(
+            "推荐主流程。并行读取用户画像、浏览、订单和购物车，使用统一公式"
+            "分别生成自然商品 Top 10 和广告 Top 3。广告分数严格高于自然"
+            "最低分时返回 requires_semantic_ranking，否则直接提交自然 Top 2。"
+            "传入从用户当前消息提取的完整结构化需求。"
+        ),
+        **tool_options,
+    )
+    async def recommend_products_tool(
+        query: str = "",
+        category: str | None = None,
+        min_price_cents: int | None = None,
+        max_price_cents: int | None = None,
+        required_tags: list[str] | None = None,
+        excluded_tags: list[str] | None = None,
+        scenario: Literal[
+            "general",
+            "self",
+            "gift",
+            "replenishment",
+        ] = "general",
+        usage: str | None = None,
+        recipient: str | None = None,
+    ) -> str:
+        demand = RecommendationDemand(
+            query=query,
+            category=category,
+            min_price_cents=min_price_cents,
+            max_price_cents=max_price_cents,
+            required_tags=required_tags or [],
+            excluded_tags=excluded_tags or [],
+            scenario=scenario,
+            usage=usage,
+            recipient=recipient,
+        )
+        agent_profile = get_agent_profile(context.user_id)
+        results = await asyncio.gather(
+            context.mall.get_platform_profile(context.user_id),
+            context.mall.get_browse_history(context.user_id, 20),
+            context.mall.get_orders(context.user_id, 20),
+            context.mall.get_cart(context.user_id),
+            context.mall.get_product_recommendations(
+                context.user_id,
+                query=query,
+                category=category,
+                min_price_cents=min_price_cents,
+                max_price_cents=max_price_cents,
+                limit=10,
+            ),
+            context.mall.search_products(
+                query=query,
+                category=category,
+                min_price_cents=min_price_cents,
+                max_price_cents=max_price_cents,
+                limit=10,
+            ),
+            context.mall.get_ad_recommendations(
+                context.user_id,
+                query=query,
+                category=category,
+                max_price_cents=max_price_cents,
+                limit=10,
+            ),
+            context.mall.list_products(),
+            return_exceptions=True,
+        )
+        (
+            platform_result,
+            browse_result,
+            orders_result,
+            cart_result,
+            recommendations_result,
+            search_result,
+            ads_result,
+            catalog_result,
+        ) = results
+
+        def source_status(value: object, *, empty: bool = False) -> SourceStatus:
+            if isinstance(value, BaseException):
+                return "unavailable"
+            return "ok_empty" if empty else "ok_with_data"
+
+        source_statuses: dict[str, SourceStatus] = {
+            "agent_profile": (
+                "ok_with_data" if agent_profile is not None else "ok_empty"
+            ),
+            "platform_profile": source_status(
+                platform_result,
+                empty=platform_result is None,
+            ),
+            "browse": source_status(
+                browse_result,
+                empty=not browse_result if isinstance(browse_result, list) else False,
+            ),
+            "orders": source_status(
+                orders_result,
+                empty=not orders_result if isinstance(orders_result, list) else False,
+            ),
+            "cart": source_status(
+                cart_result,
+                empty=not cart_result.items
+                if hasattr(cart_result, "items")
+                else False,
+            ),
+            "recommendations": source_status(
+                recommendations_result,
+                empty=not recommendations_result
+                if isinstance(recommendations_result, list)
+                else False,
+            ),
+            "search": source_status(
+                search_result,
+                empty=not search_result
+                if isinstance(search_result, list)
+                else False,
+            ),
+            "advertisement": source_status(
+                ads_result,
+                empty=not ads_result if isinstance(ads_result, list) else False,
+            ),
+            "catalog": source_status(
+                catalog_result,
+                empty=(
+                    not catalog_result.items
+                    if hasattr(catalog_result, "items")
+                    else False
+                ),
+            ),
+        }
+
+        platform_profile: PlatformProfile | None = (
+            platform_result
+            if not isinstance(platform_result, BaseException)
+            else None
+        )
+        browse_events: list[BrowseEvent] = (
+            browse_result
+            if not isinstance(browse_result, BaseException)
+            else []
+        )
+        orders: list[OrderRecord] = (
+            orders_result
+            if not isinstance(orders_result, BaseException)
+            else []
+        )
+        cart = (
+            cart_result
+            if not isinstance(cart_result, BaseException)
+            else ShoppingCart()
+        )
+        recommendation_candidates: list[ProductCandidate] = (
+            recommendations_result
+            if not isinstance(recommendations_result, BaseException)
+            else []
+        )
+        search_products_result: list[Product] = (
+            search_result
+            if not isinstance(search_result, BaseException)
+            else []
+        )
+        ad_candidates: list[ProductCandidate] = (
+            ads_result
+            if not isinstance(ads_result, BaseException)
+            else []
+        )
+        catalog = (
+            catalog_result
+            if not isinstance(catalog_result, BaseException)
+            else None
+        )
+
+        organic_products: list[Product] = []
+        seen_ids: set[str] = set()
+        for candidate in recommendation_candidates:
+            if candidate.product.id not in seen_ids:
+                organic_products.append(candidate.product)
+                seen_ids.add(candidate.product.id)
+        for product in search_products_result:
+            if product.id not in seen_ids:
+                organic_products.append(product)
+                seen_ids.add(product.id)
+
+        context.remember_products(organic_products)
+        context.remember_candidates(ad_candidates)
+        context.selected_products.clear()
+        context.semantic_ranking = None
+        context.submitted = False
+
+        batch = build_recommendation_batch(
+            demand=demand,
+            organic_products=organic_products,
+            ad_candidates=ad_candidates[:10],
+            catalog=catalog,
+            browse_events=browse_events,
+            orders=orders,
+            cart=cart,
+            agent_profile=agent_profile,
+            platform_profile=platform_profile,
+            source_statuses=source_statuses,
+        )
+        context.recommendation_batch = batch
+
+        response: dict[str, object] = {
+            "status": (
+                "requires_semantic_ranking"
+                if batch.requires_semantic_ranking
+                else "accepted"
+            ),
+            "batch": batch.model_dump(mode="json"),
+        }
+        if not batch.requires_semantic_ranking:
+            selected = await commit_scored_products(
+                context,
+                batch.organic_candidates[:2],
+            )
+            response["selected_products"] = [
+                product.model_dump(mode="json") for product in selected
+            ]
+            if not selected:
+                response["status"] = "no_match"
+        return json.dumps(response, ensure_ascii=False)
+
+    @function_tool(
+        name_override="rerank_recommendations",
+        description_override=(
+            "独立的语义终排工具。仅在 recommend_products 返回 "
+            "requires_semantic_ranking 后调用。它会使用独立 Prompt 综合公式"
+            "分数、商品语义和调用方提供的可信环境信息，最多选择两个自然商品"
+            "和一个广告商品；存在自然候选时广告不能排第一。"
+        ),
+        **tool_options,
+    )
+    async def rerank_recommendations_tool(
+        environment_context: str | None = None,
+    ) -> str:
+        batch = context.recommendation_batch
+        if batch is None:
+            return rejected("请先调用 recommend_products 生成候选")
+        if not batch.requires_semantic_ranking:
+            return rejected("当前候选不需要语义终排")
+        if context.semantic_reranker is None:
+            return unavailable_payload("语义终排")
+
+        try:
+            ranking = validate_semantic_ranking(
+                await context.semantic_reranker.rerank(
+                    batch=batch,
+                    user_request=context.current_user_request,
+                    environment_context=environment_context,
+                ),
+                batch,
+            )
+        except SemanticRerankError as exc:
+            logger.warning("semantic reranking failed: %s", exc)
+            fallback_candidates = (
+                batch.competitive_ads[:1]
+                if batch.ad_only
+                else batch.organic_candidates[:2]
+            )
+            selected = await commit_scored_products(
+                context,
+                fallback_candidates,
+                allow_ad_first=batch.ad_only,
+            )
+            return json.dumps(
+                {
+                    "status": "fallback" if selected else "no_match",
+                    "fallback_reason": str(exc),
+                    "selected_products": [
+                        product.model_dump(mode="json")
+                        for product in selected
+                    ],
+                },
+                ensure_ascii=False,
+            )
+
+        candidates_by_key = {
+            (candidate.channel, candidate.product.id): candidate
+            for candidate in semantic_candidates(batch)
+        }
+        selected_candidates = [
+            candidates_by_key[(item.channel, item.product_id)]
+            for item in ranking.items
+        ]
+        selected = await commit_scored_products(
+            context,
+            selected_candidates,
+            allow_ad_first=batch.ad_only,
+        )
+        context.semantic_ranking = ranking
+        return json.dumps(
+            {
+                "status": "accepted" if selected else "no_match",
+                "semantic_ranking": ranking.model_dump(mode="json"),
+                "selected_products": [
+                    product.model_dump(mode="json") for product in selected
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    @function_tool(
         name_override="update_plan",
         description_override=(
             "创建或整体替换当前 Plan 和 Plan State。状态、当前步骤、下一步、"
@@ -519,98 +899,9 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
             ensure_ascii=False,
         )
 
-    @function_tool(
-        name_override="submit_recommendations",
-        description_override=(
-            "提交最终推荐。只能选择已通过商城工具获取的商品 ID，"
-            "最多三个且最多一个广告。没有合适商品时提交空列表并说明原因。"
-        ),
-        **tool_options,
-    )
-    async def submit_recommendations_tool(
-        items: list[RecommendationSelection],
-        no_match_reason: str | None = None,
-    ) -> str:
-        if len(items) > 3:
-            return rejected("最终推荐最多三个商品")
-        if not items:
-            context.selected_products.clear()
-            context.submitted = True
-            return json.dumps(
-                {
-                    "status": "accepted",
-                    "count": 0,
-                    "no_match_reason": no_match_reason
-                    or "当前商城没有合适商品",
-                },
-                ensure_ascii=False,
-            )
-
-        selected_ids = [item.product_id for item in items]
-        if len(selected_ids) != len(set(selected_ids)):
-            return rejected("最终推荐包含重复商品")
-        if sum(1 for item in items if item.source == "ad") > 1:
-            return rejected("最终推荐最多包含一个广告商品")
-
-        selected: dict[str, Product] = {}
-        for item in items:
-            product = context.candidate_products.get(item.product_id)
-            if product is None:
-                return rejected(
-                    f"商品 {item.product_id} 不在本次已获取的候选商品中"
-                )
-            if item.source == "ad" and item.product_id not in context.ad_product_ids:
-                return rejected(
-                    f"商品 {item.product_id} 没有来自广告推荐接口"
-                )
-            if (
-                item.source == "organic"
-                and item.product_id not in context.organic_product_ids
-            ):
-                return rejected(
-                    f"商品 {item.product_id} 没有来自商品推荐或搜索接口"
-                )
-            try:
-                authoritative_product = await context.mall.get_product(
-                    item.product_id
-                )
-            except Exception:
-                logger.warning(
-                    "failed to confirm product %s",
-                    item.product_id,
-                    exc_info=True,
-                )
-                return rejected(f"暂时无法确认商品 {item.product_id} 的库存和价格")
-            if authoritative_product is None:
-                return rejected(f"商品 {item.product_id} 不存在")
-            product = authoritative_product
-            if product.stock is not None and product.stock <= 0:
-                return rejected(f"商品 {item.product_id} 当前缺货")
-            if item.source == "ad":
-                ad = context.ad_metadata.get(item.product_id)
-                product = product.model_copy(
-                    update={
-                        "is_ad": True,
-                        "ad_label": "广告",
-                        "ad_id": ad.ad_id if ad is not None else None,
-                        "campaign_id": ad.campaign_id if ad is not None else None,
-                    }
-                )
-            selected[product.id] = product
-
-        context.selected_products = selected
-        context.submitted = True
-        return json.dumps(
-            {
-                "status": "accepted",
-                "count": len(selected),
-                "products": list(selected.values()),
-            },
-            ensure_ascii=False,
-            default=lambda value: value.model_dump(mode="json"),
-        )
-
     return [
+        recommend_products_tool,
+        rerank_recommendations_tool,
         update_plan_tool,
         get_agent_profile_tool,
         get_platform_profile_tool,
@@ -623,7 +914,6 @@ def create_tools(context: ShoppingAgentContext, config: LLMConfig) -> list[Any]:
         get_product_tool,
         create_order_tool,
         get_order_tool,
-        submit_recommendations_tool,
     ]
 
 
@@ -653,6 +943,7 @@ async def stream_agent_reply(
         mall=mall,
         turn_id=message_id,
         plan_state=previous_plan_state,
+        current_user_request=messages[-1].content if messages else "",
     )
     context.remember_products(previous_recommendations)
     content_parts: list[str] = []
@@ -660,7 +951,7 @@ async def stream_agent_reply(
     recommendations_emitted = False
     try:
         instructions = instructions_with_plan_state(
-            load_agent_prompt(config),
+            load_prompt(SHOPPING_AGENT_PROMPT_PATH),
             previous_plan_state,
             previous_recommendations,
             previous_orders,
@@ -669,7 +960,7 @@ async def stream_agent_reply(
             client = AsyncOpenAI(
                 api_key=config.api_key.get_secret_value(),
                 base_url=normalize_openai_base_url(config.base_url),
-                timeout=config.timeout_seconds,
+                timeout=config.model_timeout_limit,
                 max_retries=1,
             )
             model = OpenAIChatCompletionsModel(
@@ -679,14 +970,22 @@ async def stream_agent_reply(
             )
         else:
             model = model_override
+        semantic_reranker = AgentSemanticReranker(
+            config=config,
+            model=model,
+        )
         agent = Agent[ShoppingAgentContext](
             name="小牛导购",
             instructions=instructions,
             model=model,
-            tools=create_tools(context, config),
+            tools=create_tools(
+                context,
+                config,
+                semantic_reranker=semantic_reranker,
+            ),
             model_settings=ModelSettings(
                 temperature=config.temperature,
-                max_tokens=config.max_tokens,
+                max_tokens=config.output_token_limit,
             ),
         )
 
@@ -767,11 +1066,7 @@ async def stream_agent_reply(
                             mode="json"
                         ),
                     }
-                if (
-                    tool_name == "submit_recommendations"
-                    and context.selected_products
-                    and not recommendations_emitted
-                ):
+                if context.selected_products and not recommendations_emitted:
                     recommendations_emitted = True
                     yield {
                         "type": "recommendations",
@@ -781,7 +1076,6 @@ async def stream_agent_reply(
                             for product in context.selected_products.values()
                         ],
                     }
-
         if not content_parts and isinstance(result.final_output, str):
             content_parts.append(result.final_output)
             yield {
@@ -798,6 +1092,7 @@ async def stream_agent_reply(
             }
 
         if context.selected_products and not recommendations_emitted:
+            recommendations_emitted = True
             yield {
                 "type": "recommendations",
                 "message_id": message_id,
@@ -822,6 +1117,10 @@ async def stream_agent_reply(
                 order.model_dump(mode="json")
                 for order in context.created_orders.values()
             ],
+            "recommendations": [
+                product.model_dump(mode="json")
+                for product in context.selected_products.values()
+            ],
         }
     except PromptLoadError as exc:
         yield {
@@ -837,6 +1136,10 @@ async def stream_agent_reply(
             "orders": [
                 order.model_dump(mode="json")
                 for order in context.created_orders.values()
+            ],
+            "recommendations": [
+                product.model_dump(mode="json")
+                for product in context.selected_products.values()
             ],
         }
     except MaxTurnsExceeded:
@@ -860,6 +1163,10 @@ async def stream_agent_reply(
                 order.model_dump(mode="json")
                 for order in context.created_orders.values()
             ],
+            "recommendations": [
+                product.model_dump(mode="json")
+                for product in context.selected_products.values()
+            ],
         }
     except Exception:
         logger.exception("Agents SDK run failed")
@@ -881,6 +1188,10 @@ async def stream_agent_reply(
             "orders": [
                 order.model_dump(mode="json")
                 for order in context.created_orders.values()
+            ],
+            "recommendations": [
+                product.model_dump(mode="json")
+                for product in context.selected_products.values()
             ],
         }
     finally:

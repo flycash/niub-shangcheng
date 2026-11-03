@@ -142,10 +142,72 @@ class ProductCandidate(BaseModel):
     ad: AdInfo | None = None
 
 
-class RecommendationSelection(BaseModel):
+class RecommendationDemand(BaseModel):
+    query: str = Field(default="", max_length=500)
+    category: str | None = Field(default=None, max_length=100)
+    min_price_cents: int | None = Field(default=None, ge=0)
+    max_price_cents: int | None = Field(default=None, ge=0)
+    required_tags: list[str] = Field(default_factory=list)
+    excluded_tags: list[str] = Field(default_factory=list)
+    scenario: Literal[
+        "general",
+        "self",
+        "gift",
+        "replenishment",
+    ] = "general"
+    usage: str | None = Field(default=None, max_length=500)
+    recipient: str | None = Field(default=None, max_length=200)
+
+
+SourceStatus = Literal["ok_with_data", "ok_empty", "unavailable"]
+
+
+class SourceEvidence(BaseModel):
+    source: Literal[
+        "need",
+        "cart",
+        "browse",
+        "order",
+        "agent_profile",
+        "platform_profile",
+    ]
+    signal_score: float = Field(ge=0, le=1)
+    weighted_points: float = Field(ge=0, le=100)
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class ScoredProduct(BaseModel):
+    product: Product
+    channel: Literal["organic", "ad"]
+    score: float = Field(ge=0, le=100)
+    confidence: Literal["high", "medium", "low"]
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+    penalties: list[str] = Field(default_factory=list)
+    ad: AdInfo | None = None
+
+
+class RecommendationBatch(BaseModel):
+    demand: RecommendationDemand
+    organic_candidates: list[ScoredProduct] = Field(default_factory=list)
+    ad_candidates: list[ScoredProduct] = Field(default_factory=list)
+    cutoff_score: float | None = None
+    competitive_ads: list[ScoredProduct] = Field(default_factory=list)
+    requires_semantic_ranking: bool = False
+    ad_only: bool = False
+    source_statuses: dict[str, SourceStatus] = Field(default_factory=dict)
+    generated_at: str
+
+
+class SemanticRankingItem(BaseModel):
     product_id: str = Field(min_length=1, max_length=100)
-    source: Literal["organic", "ad"]
+    channel: Literal["organic", "ad"]
     reason: str = Field(min_length=1, max_length=500)
+    environmental_fit: str | None = Field(default=None, max_length=500)
+
+
+class SemanticRankingResult(BaseModel):
+    items: list[SemanticRankingItem] = Field(default_factory=list)
+    summary: str = Field(default="", max_length=1_000)
 
 
 PlanStepStatus = Literal[
@@ -190,7 +252,7 @@ class PlanState(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=2_000)
+    message: str = Field(min_length=1, max_length=100_000)
 
     @field_validator("message")
     @classmethod
@@ -208,7 +270,7 @@ class ChatResponse(BaseModel):
 
 class ConversationMessage(BaseModel):
     role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=10_000)
+    content: str = Field(min_length=1, max_length=100_000)
 
     @field_validator("content")
     @classmethod
@@ -221,7 +283,7 @@ class ConversationMessage(BaseModel):
 
 class StreamChatRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=64)
-    message: str = Field(min_length=1, max_length=10_000)
+    message: str = Field(min_length=1, max_length=100_000)
 
     @field_validator("message")
     @classmethod

@@ -49,4 +49,4 @@ def test_agent_can_read_user_context_and_recommendations() -> None:
     assert cart.items[0].product_id == "commuter-backpack"
     assert profile is not None
     assert len(products) <= 3
-    assert len(ads) <= 1
+    assert len(ads) <= 10

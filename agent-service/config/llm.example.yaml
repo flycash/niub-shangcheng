@@ -5,9 +5,9 @@ llm:
 
   # Optional generation settings. Remove them if your provider does not support them.
   temperature: 0.7
-  max_tokens: 800
-  timeout_seconds: 60
-  # 串行调用多个数据源时至少需要 10 个模型/工具回合。
+  # 800 等过小值会触发 finish_reason=length，运行时最低按 32768 处理。
+  max_tokens: 32768
+  timeout_seconds: 1800
+  # 推荐主流程和可能的独立语义终排至少需要 10 个模型/工具回合。
   max_turns: 10
-  tool_timeout_seconds: 8
-  prompt_file: "../prompts/shopping_agent.md"
+  tool_timeout_seconds: 1800

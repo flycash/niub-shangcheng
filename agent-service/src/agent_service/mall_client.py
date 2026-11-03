@@ -130,7 +130,7 @@ class MallClient:
             "category": category,
             "max_price_cents": max_price_cents,
             "min_price_cents": min_price_cents,
-            "limit": max(1, min(limit, 5)),
+            "limit": max(1, min(limit, 10)),
         }
         payload = await self._request(
             "GET",
@@ -195,7 +195,7 @@ class MallClient:
         category: str | None = None,
         min_price_cents: int | None = None,
         max_price_cents: int | None = None,
-        limit: int = 5,
+        limit: int = 10,
     ) -> list[ProductCandidate]:
         payload = await self._request(
             "POST",
@@ -206,7 +206,7 @@ class MallClient:
                 "category": category,
                 "min_price_cents": min_price_cents,
                 "max_price_cents": max_price_cents,
-                "limit": max(1, min(limit, 5)),
+                "limit": max(1, min(limit, 10)),
             },
         )
         return self._validate(RecommendationResponse, payload).items
@@ -217,6 +217,7 @@ class MallClient:
         query: str = "",
         category: str | None = None,
         max_price_cents: int | None = None,
+        limit: int = 10,
     ) -> list[ProductCandidate]:
         payload = await self._request(
             "POST",
@@ -226,6 +227,7 @@ class MallClient:
                 "query": query,
                 "category": category,
                 "max_price_cents": max_price_cents,
+                "limit": max(1, min(limit, 10)),
             },
         )
         return self._validate(RecommendationResponse, payload).items

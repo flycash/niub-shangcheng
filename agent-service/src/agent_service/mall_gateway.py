@@ -7,11 +7,14 @@ from .models import (
     PlatformProfile,
     Product,
     ProductCandidate,
+    ProductList,
     ShoppingCart,
 )
 
 
 class MallGateway(Protocol):
+    async def list_products(self) -> ProductList: ...
+
     async def search_products(
         self,
         query: str = "",
@@ -49,7 +52,7 @@ class MallGateway(Protocol):
         category: str | None = None,
         min_price_cents: int | None = None,
         max_price_cents: int | None = None,
-        limit: int = 5,
+        limit: int = 10,
     ) -> list[ProductCandidate]: ...
 
     async def get_ad_recommendations(
@@ -58,6 +61,7 @@ class MallGateway(Protocol):
         query: str = "",
         category: str | None = None,
         max_price_cents: int | None = None,
+        limit: int = 10,
     ) -> list[ProductCandidate]: ...
 
     async def create_order(

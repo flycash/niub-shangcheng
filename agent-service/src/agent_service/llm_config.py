@@ -1,5 +1,4 @@
 import os
-import warnings
 from pathlib import Path
 
 import yaml
@@ -9,7 +8,6 @@ from pydantic import (
     SecretStr,
     ValidationError,
     field_validator,
-    model_validator,
 )
 
 
@@ -19,6 +17,9 @@ class LLMConfigError(Exception):
 
 MIN_RECOMMENDATION_TURNS = 10
 MAX_RECOMMENDATION_TURNS = 100
+MIN_AGENT_OUTPUT_TOKENS = 32_768
+DEFAULT_LONG_TIMEOUT_SECONDS = 1_800
+MAX_LONG_TIMEOUT_SECONDS = 3_600
 
 
 class LLMConfig(BaseModel):
@@ -27,15 +28,34 @@ class LLMConfig(BaseModel):
     model: str
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)
-    timeout_seconds: float = Field(default=60, gt=0, le=600)
+    timeout_seconds: float = Field(
+        default=DEFAULT_LONG_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_LONG_TIMEOUT_SECONDS,
+    )
     max_turns: int = Field(
         default=MIN_RECOMMENDATION_TURNS,
         ge=MIN_RECOMMENDATION_TURNS,
         le=MAX_RECOMMENDATION_TURNS,
     )
-    tool_timeout_seconds: float = Field(default=8, gt=0, le=60)
-    prompt_file: str | None = None
-    system_prompt: str | None = None
+    tool_timeout_seconds: float = Field(
+        default=DEFAULT_LONG_TIMEOUT_SECONDS,
+        gt=0,
+        le=DEFAULT_LONG_TIMEOUT_SECONDS,
+    )
+
+    @property
+    def output_token_limit(self) -> int:
+        """Keep enough output budget for tool calls and reasoned final replies."""
+        return max(self.max_tokens or 0, MIN_AGENT_OUTPUT_TOKENS)
+
+    @property
+    def model_timeout_limit(self) -> float:
+        return max(self.timeout_seconds, DEFAULT_LONG_TIMEOUT_SECONDS)
+
+    @property
+    def tool_timeout_limit(self) -> float:
+        return max(self.tool_timeout_seconds, DEFAULT_LONG_TIMEOUT_SECONDS)
 
     @field_validator("base_url", "model")
     @classmethod
@@ -44,14 +64,6 @@ class LLMConfig(BaseModel):
         if not value:
             raise ValueError("value must not be blank")
         return value
-
-    @field_validator("prompt_file", "system_prompt")
-    @classmethod
-    def strip_optional_text_fields(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        return value or None
 
     @field_validator("base_url")
     @classmethod
@@ -66,12 +78,6 @@ class LLMConfig(BaseModel):
         if not value.get_secret_value().strip():
             raise ValueError("api_key must not be blank")
         return value
-
-    @model_validator(mode="after")
-    def require_prompt_source(self) -> "LLMConfig":
-        if not self.prompt_file and not self.system_prompt:
-            raise ValueError("prompt_file or system_prompt is required")
-        return self
 
 
 def resolve_config_path(config_path: str | Path | None = None) -> Path:
@@ -108,29 +114,8 @@ def load_llm_config(config_path: str | Path | None = None) -> LLMConfig:
         fields = ", ".join(
             ".".join(str(part) for part in error["loc"]) for error in exc.errors()
         )
-        if not fields:
-            fields = "prompt_file/system_prompt"
         raise LLMConfigError(
             f"invalid LLM config file: {path} (fields: {fields})"
         ) from exc
-
-    if config.system_prompt and not config.prompt_file:
-        warnings.warn(
-            "llm.system_prompt is deprecated; migrate to llm.prompt_file",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    elif config.system_prompt and config.prompt_file:
-        warnings.warn(
-            "llm.system_prompt is ignored because llm.prompt_file is set",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    if config.prompt_file:
-        prompt_path = Path(config.prompt_file).expanduser()
-        if not prompt_path.is_absolute():
-            prompt_path = path.parent / prompt_path
-        config.prompt_file = str(prompt_path.resolve())
 
     return config

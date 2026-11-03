@@ -192,9 +192,10 @@ const toolLabels: Record<string, string> = {
   get_cart: "读取购物车",
   get_product_recommendations: "获取商品推荐",
   get_ad_recommendations: "获取广告推荐",
+  recommend_products: "公式评分与候选分路",
+  rerank_recommendations: "语义最终排序",
   search_products: "搜索商品",
   get_product: "查询详情",
-  submit_recommendations: "生成最终推荐",
   create_order: "创建待支付订单",
   get_order: "查询订单",
 };
@@ -873,7 +874,11 @@ export function AgentChat() {
                   {item.products?.length ? (
                     <div className={styles.recommendations}>
                       {item.products.slice(0, 3).map((product) => (
-                        <article className={styles.productCard} key={product.id}>
+                        <Link
+                          className={styles.productCard}
+                          href={`/products/${encodeURIComponent(product.id)}`}
+                          key={product.id}
+                        >
                           <div className={styles.productTopline}>
                             <span>{product.category}</span>
                             <span className={styles.productBadges}>
@@ -908,7 +913,10 @@ export function AgentChat() {
                               <span key={tag}>{tag}</span>
                             ))}
                           </div>
-                        </article>
+                          <span className={styles.productLinkHint}>
+                            查看详情 →
+                          </span>
+                        </Link>
                       ))}
                     </div>
                   ) : null}

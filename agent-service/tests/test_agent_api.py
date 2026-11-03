@@ -17,7 +17,6 @@ TEST_CONFIG = LLMConfig(
     base_url="http://model.test/v1",
     api_key="test-key",
     model="test-model",
-    system_prompt="test prompt",
 )
 
 
@@ -88,6 +87,22 @@ ORDER_LINK = {
     "ordered_at": "2026-11-02T12:10:00+00:00",
 }
 
+RECOMMENDED_PRODUCT = {
+    "id": "tote",
+    "name": "帆布托特包",
+    "description": "通勤包",
+    "price_cents": 6900,
+    "category": "箱包",
+    "badge": "人气单品",
+    "stock": 10,
+    "tags": ["通勤"],
+    "image_url": None,
+    "is_ad": True,
+    "ad_label": "广告",
+    "ad_id": "ad-test",
+    "campaign_id": "campaign-test",
+}
+
 
 async def fake_agent_stream(
     messages,
@@ -124,23 +139,7 @@ async def fake_agent_stream(
     yield {
         "type": "recommendations",
         "message_id": "assistant-test",
-        "products": [
-            {
-                "id": "tote",
-                "name": "帆布托特包",
-                "description": "通勤包",
-                "price_cents": 6900,
-                "category": "箱包",
-                "badge": "人气单品",
-                "stock": 10,
-                "tags": ["通勤"],
-                "image_url": None,
-                "is_ad": True,
-                "ad_label": "广告",
-                "ad_id": "ad-test",
-                "campaign_id": "campaign-test",
-            }
-        ],
+        "products": [RECOMMENDED_PRODUCT],
     }
     yield {
         "type": "delta",
@@ -161,6 +160,7 @@ async def fake_agent_stream(
         ],
         "plan_state": PLAN_STATE,
         "orders": [ORDER_LINK],
+        "recommendations": [RECOMMENDED_PRODUCT],
     }
 
 
