@@ -159,6 +159,71 @@ class RecommendationDemand(BaseModel):
     recipient: str | None = Field(default=None, max_length=200)
 
 
+IntentType = str
+
+
+class GoalUnderstandingDraft(BaseModel):
+    intents: list[IntentType] = Field(min_length=1, max_length=5)
+    goal: str = Field(min_length=1, max_length=2_000)
+    confidence: float = Field(ge=0, le=1)
+    slots: dict[str, object] = Field(default_factory=dict)
+    missing_slots: list[str] = Field(default_factory=list)
+    requires_clarification: bool = False
+    clarification_question: str | None = Field(default=None, max_length=1_000)
+
+
+class GoalUnderstandingResult(BaseModel):
+    primary_intent: IntentType
+    intents: list[IntentType] = Field(min_length=1, max_length=5)
+    pending_intents: list[IntentType] = Field(default_factory=list)
+    goal: str = Field(min_length=1, max_length=2_000)
+    confidence: float = Field(ge=0, le=1)
+    slots: dict[str, object] = Field(default_factory=dict)
+    missing_slots: list[str] = Field(default_factory=list)
+    requires_clarification: bool = False
+    clarification_question: str | None = Field(default=None, max_length=1_000)
+    pending_intent_question: str | None = Field(default=None, max_length=1_000)
+
+
+class RecommendationSpecHardConstraints(BaseModel):
+    category: str | None = Field(default=None, max_length=100)
+    min_price_cents: int | None = Field(default=None, ge=0)
+    max_price_cents: int | None = Field(default=None, ge=0)
+    required_tags: list[str] = Field(default_factory=list)
+    excluded_tags: list[str] = Field(default_factory=list)
+
+
+class RecommendationSpecEvidence(BaseModel):
+    source: str = Field(min_length=1, max_length=100)
+    observation: str = Field(min_length=1, max_length=500)
+    influence: Literal["high", "medium", "low"]
+
+
+class RecommendationSpec(BaseModel):
+    goal_summary: str = Field(min_length=1, max_length=1_000)
+    hard_constraints: RecommendationSpecHardConstraints = Field(
+        default_factory=RecommendationSpecHardConstraints
+    )
+    preferred_categories: list[str] = Field(default_factory=list)
+    preferred_tags: list[str] = Field(default_factory=list)
+    weak_categories: list[str] = Field(default_factory=list)
+    negative_tags: list[str] = Field(default_factory=list)
+    search_queries: list[str] = Field(min_length=1, max_length=6)
+    scenario: Literal[
+        "general",
+        "self",
+        "gift",
+        "replenishment",
+    ] = "general"
+    usage: str | None = Field(default=None, max_length=500)
+    recipient: str | None = Field(default=None, max_length=200)
+    source_evidence: list[RecommendationSpecEvidence] = Field(
+        default_factory=list
+    )
+    confidence: float = Field(ge=0, le=1)
+    missing_information: list[str] = Field(default_factory=list)
+
+
 SourceStatus = Literal["ok_with_data", "ok_empty", "unavailable"]
 
 
@@ -311,6 +376,8 @@ class StoredMessage(BaseModel):
     recommendations: list[Product] = Field(default_factory=list)
     tool_trace: list[ToolTrace] = Field(default_factory=list)
     plan_state: PlanState | None = None
+    goal_understanding: GoalUnderstandingResult | None = None
+    recommendation_spec: RecommendationSpec | None = None
     orders: list[OrderLink] = Field(default_factory=list)
 
 

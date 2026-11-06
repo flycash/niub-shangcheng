@@ -103,6 +103,41 @@ RECOMMENDED_PRODUCT = {
     "campaign_id": "campaign-test",
 }
 
+GOAL_UNDERSTANDING = {
+    "primary_intent": "product_recommendation",
+    "intents": ["product_recommendation", "order_query"],
+    "pending_intents": ["order_query"],
+    "goal": "推荐商品并查询订单",
+    "confidence": 0.95,
+    "slots": {"query": "通勤"},
+    "missing_slots": [],
+    "requires_clarification": False,
+    "clarification_question": None,
+    "pending_intent_question": "是否继续处理订单查询？",
+}
+
+RECOMMENDATION_SPEC = {
+    "goal_summary": "推荐通勤商品",
+    "hard_constraints": {
+        "category": None,
+        "min_price_cents": None,
+        "max_price_cents": 30000,
+        "required_tags": [],
+        "excluded_tags": [],
+    },
+    "preferred_categories": ["箱包"],
+    "preferred_tags": ["通勤"],
+    "weak_categories": [],
+    "negative_tags": [],
+    "search_queries": ["通勤", "办公室"],
+    "scenario": "self",
+    "usage": "通勤",
+    "recipient": None,
+    "source_evidence": [],
+    "confidence": 0.9,
+    "missing_information": [],
+}
+
 
 async def fake_agent_stream(
     messages,
@@ -111,6 +146,7 @@ async def fake_agent_stream(
     previous_plan_state=None,
     previous_recommendations=None,
     previous_orders=None,
+    previous_goal_understanding=None,
 ):
     yield {"type": "start", "message_id": "assistant-test"}
     yield {
@@ -161,6 +197,8 @@ async def fake_agent_stream(
         "plan_state": PLAN_STATE,
         "orders": [ORDER_LINK],
         "recommendations": [RECOMMENDED_PRODUCT],
+        "goal_understanding": GOAL_UNDERSTANDING,
+        "recommendation_spec": RECOMMENDATION_SPEC,
     }
 
 
@@ -233,6 +271,15 @@ def test_stream_chat_persists_completed_conversation(
     assert detail.messages[1].recommendations[0].id == "tote"
     assert detail.messages[1].recommendations[0].is_ad is True
     assert detail.messages[1].recommendations[0].ad_label == "广告"
+    assert detail.messages[1].goal_understanding is not None
+    assert detail.messages[1].goal_understanding.pending_intents == [
+        "order_query"
+    ]
+    assert detail.messages[1].recommendation_spec is not None
+    assert detail.messages[1].recommendation_spec.search_queries == [
+        "通勤",
+        "办公室",
+    ]
     assert detail.messages[1].tool_trace[0].tool == "search_products"
     assert detail.messages[1].plan_state is not None
     assert detail.messages[1].plan_state.plan.plan_id == "plan-test"
@@ -289,6 +336,7 @@ def test_stream_chat_persists_partial_reply_on_error(
         previous_plan_state=None,
         previous_recommendations=None,
         previous_orders=None,
+        previous_goal_understanding=None,
     ):
         yield {"type": "start", "message_id": "assistant-test"}
         yield {
@@ -345,6 +393,7 @@ def test_stream_chat_passes_previous_plan_state_to_next_turn(
                     "category": "箱包",
                 }
             ],
+            "goal_understanding": GOAL_UNDERSTANDING,
             "orders": [ORDER_LINK],
         },
     )
@@ -357,10 +406,12 @@ def test_stream_chat_passes_previous_plan_state_to_next_turn(
         previous_plan_state=None,
         previous_recommendations=None,
         previous_orders=None,
+        previous_goal_understanding=None,
     ):
         captured["plan_state"] = previous_plan_state
         captured["previous_recommendations"] = previous_recommendations
         captured["previous_orders"] = previous_orders
+        captured["previous_goal_understanding"] = previous_goal_understanding
         yield {"type": "start", "message_id": "assistant-next"}
         yield {"type": "delta", "content": "继续完成"}
         yield {
@@ -388,6 +439,9 @@ def test_stream_chat_passes_previous_plan_state_to_next_turn(
     assert captured["plan_state"].current_step_id == "submit"
     assert captured["previous_recommendations"][0].id == "tote"
     assert captured["previous_orders"][0].order_id == "order-test"
+    assert captured["previous_goal_understanding"].pending_intents == [
+        "order_query"
+    ]
 
 
 def test_conversation_history_endpoints(store: ConversationStore) -> None:

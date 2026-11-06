@@ -16,9 +16,11 @@ from .models import (
     ConversationDetail,
     ConversationList,
     ConversationMessage,
+    GoalUnderstandingResult,
     OrderLink,
     PlanState,
     Product,
+    RecommendationSpec,
     StreamChatRequest,
     StoredMessage,
     ToolTrace,
@@ -66,6 +68,15 @@ def latest_orders(
     return []
 
 
+def latest_goal_understanding(
+    messages: Sequence[StoredMessage],
+) -> GoalUnderstandingResult | None:
+    for message in reversed(messages):
+        if message.goal_understanding is not None:
+            return message.goal_understanding
+    return None
+
+
 async def persisted_agent_stream(
     conversation_id: str,
     conversation_title: str,
@@ -79,6 +90,8 @@ async def persisted_agent_stream(
     recommendations: dict[str, Product] = {}
     tool_trace: list[ToolTrace] = []
     plan_state: PlanState | None = None
+    goal_understanding: GoalUnderstandingResult | None = None
+    recommendation_spec: RecommendationSpec | None = None
     created_orders: dict[str, OrderLink] = {}
     persisted = False
 
@@ -94,6 +107,14 @@ async def persisted_agent_stream(
         }
         if plan_state is not None:
             metadata["plan_state"] = plan_state.model_dump(mode="json")
+        if goal_understanding is not None:
+            metadata["goal_understanding"] = goal_understanding.model_dump(
+                mode="json"
+            )
+        if recommendation_spec is not None:
+            metadata["recommendation_spec"] = recommendation_spec.model_dump(
+                mode="json"
+            )
         if created_orders:
             metadata["orders"] = [
                 order.model_dump(mode="json")
@@ -117,6 +138,7 @@ async def persisted_agent_stream(
             previous_plan_state=latest_plan_state(context),
             previous_recommendations=latest_recommendations(context),
             previous_orders=latest_orders(context),
+            previous_goal_understanding=latest_goal_understanding(context),
         ):
             event_type = event.get("type")
             raw_event = sse_event(event)
@@ -198,6 +220,16 @@ async def persisted_agent_stream(
                         if isinstance(product_payload, dict):
                             product = Product.model_validate(product_payload)
                             recommendations[product.id] = product
+                goal_payload = event.get("goal_understanding")
+                if isinstance(goal_payload, dict):
+                    goal_understanding = GoalUnderstandingResult.model_validate(
+                        goal_payload
+                    )
+                spec_payload = event.get("recommendation_spec")
+                if isinstance(spec_payload, dict):
+                    recommendation_spec = RecommendationSpec.model_validate(
+                        spec_payload
+                    )
                 store.finish_message(
                     assistant_message_id,
                     "".join(content_parts) or error_message,
@@ -228,6 +260,16 @@ async def persisted_agent_stream(
                         if isinstance(product_payload, dict):
                             product = Product.model_validate(product_payload)
                             recommendations[product.id] = product
+                goal_payload = event.get("goal_understanding")
+                if isinstance(goal_payload, dict):
+                    goal_understanding = GoalUnderstandingResult.model_validate(
+                        goal_payload
+                    )
+                spec_payload = event.get("recommendation_spec")
+                if isinstance(spec_payload, dict):
+                    recommendation_spec = RecommendationSpec.model_validate(
+                        spec_payload
+                    )
                 store.finish_message(
                     assistant_message_id,
                     "".join(content_parts),

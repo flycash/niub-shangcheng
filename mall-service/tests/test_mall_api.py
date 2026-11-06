@@ -111,6 +111,90 @@ def test_product_and_ad_recommendations() -> None:
         assert ads[0]["ad"]["label"] == "广告"
 
 
+def test_spec_search_logs_mock_es_query_and_returns_products(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    spec = {
+        "goal_summary": "找一盏卧室桌面灯",
+        "hard_constraints": {
+            "category": "家居",
+            "min_price_cents": 5000,
+            "max_price_cents": 20000,
+            "required_tags": ["台灯"],
+            "excluded_tags": [],
+        },
+        "preferred_categories": ["家居"],
+        "preferred_tags": ["卧室", "暖光"],
+        "weak_categories": [],
+        "negative_tags": [],
+        "search_queries": ["月影桌面灯", "卧室台灯"],
+        "scenario": "self",
+        "usage": "卧室阅读照明",
+        "recipient": None,
+        "source_evidence": [
+            {
+                "source": "browse",
+                "observation": "最近浏览过桌面灯",
+                "influence": "medium",
+            }
+        ],
+        "confidence": 0.91,
+        "missing_information": [],
+    }
+    caplog.set_level("INFO", logger="mall_service.search")
+
+    response = client.post(
+        "/api/search/organic",
+        json={"spec": spec, "limit": 5},
+    )
+
+    assert response.status_code == 200
+    products = response.json()["items"]
+    assert products
+    assert products[0]["id"] == "moon-lamp"
+    assert all(product["price_cents"] <= 20000 for product in products)
+    assert "mock_es_query channel=organic" in caplog.text
+    assert '"category.keyword"' in caplog.text
+    assert '"range"' in caplog.text
+    assert '"multi_match"' in caplog.text
+    assert "最近浏览过桌面灯" in caplog.text
+
+
+def test_spec_ad_search_returns_ad_candidates() -> None:
+    spec = {
+        "goal_summary": "找通勤小物",
+        "hard_constraints": {
+            "category": None,
+            "min_price_cents": None,
+            "max_price_cents": 30000,
+            "required_tags": [],
+            "excluded_tags": [],
+        },
+        "preferred_categories": ["箱包"],
+        "preferred_tags": ["通勤"],
+        "weak_categories": [],
+        "negative_tags": [],
+        "search_queries": ["通勤", "办公室"],
+        "scenario": "self",
+        "usage": "通勤",
+        "recipient": None,
+        "source_evidence": [],
+        "confidence": 0.9,
+        "missing_information": [],
+    }
+
+    response = client.post(
+        "/api/search/ads",
+        json={"spec": spec, "limit": 3},
+    )
+
+    assert response.status_code == 200
+    ads = response.json()["items"]
+    assert 0 < len(ads) <= 3
+    assert all(item["source"] == "advertisement" for item in ads)
+    assert all(item["ad"]["is_ad"] is True for item in ads)
+
+
 def test_create_order_uses_catalog_snapshot_and_is_idempotent() -> None:
     body = {
         "items": [{"product_id": "commuter-backpack", "quantity": 1}],

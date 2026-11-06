@@ -7,20 +7,26 @@ from agents.tool_context import ToolContext
 from mall_service.api import app as mall_app
 
 from agent_service.agent_runner import (
+    RecommendationContextSnapshot,
     ShoppingAgentContext,
     create_tools,
     normalize_openai_base_url,
     stream_agent_reply,
 )
+from agent_service.goal_understanding import AgentGoalUnderstander
 from agent_service.llm_config import LLMConfig
 from agent_service.mall_client import MallClient
 from agent_service.models import (
     AdInfo,
     ConversationMessage,
+    GoalUnderstandingResult,
+    OrderLink,
     PlanState,
     Product,
     RecommendationBatch,
     RecommendationDemand,
+    RecommendationSpec,
+    RecommendationSpecHardConstraints,
     ScoredProduct,
     SemanticRankingItem,
     SemanticRankingResult,
@@ -30,6 +36,8 @@ from agent_service.recommendation_reranker import (
     AgentSemanticReranker,
     semantic_candidates,
 )
+from agent_service.recommendation_spec import AgentRecommendationSpecGenerator
+
 
 def llm_config() -> LLMConfig:
     return LLMConfig(
@@ -136,6 +144,17 @@ def invoke_tool(context: ShoppingAgentContext, name: str, arguments: dict):
     )
 
 
+def prepare_recommendation_context(
+    context: ShoppingAgentContext,
+    *,
+    spec: RecommendationSpec | None = None,
+) -> None:
+    invoke_tool(context, "collect_recommendation_context", {})
+    context.recommendation_spec = spec or recommendation_spec()
+    invoke_tool(context, "search_organic_candidates", {})
+    invoke_tool(context, "search_ad_candidates", {})
+
+
 class UnavailableMall:
     async def get_browse_history(self, user_id: int, limit: int = 10):
         raise RuntimeError("mall unavailable")
@@ -155,6 +174,86 @@ class StaticSemanticReranker:
     ) -> SemanticRankingResult:
         self.environment_context = environment_context
         return self.result
+
+
+class StaticGoalUnderstander:
+    def __init__(self, result: GoalUnderstandingResult) -> None:
+        self.result = result
+        self.previous_goal: GoalUnderstandingResult | None = None
+
+    async def understand(
+        self,
+        *,
+        current_message: str,
+        recent_messages: list[ConversationMessage],
+        previous_goal: GoalUnderstandingResult | None,
+        previous_recommendations: list[Product],
+        previous_orders: list[OrderLink],
+    ) -> GoalUnderstandingResult:
+        self.previous_goal = previous_goal
+        return self.result
+
+
+class StaticRecommendationSpecGenerator:
+    def __init__(self, result: RecommendationSpec) -> None:
+        self.result = result
+
+    async def generate(
+        self,
+        *,
+        goal: GoalUnderstandingResult,
+        agent_profile,
+        platform_profile,
+        cart,
+        browse_history,
+        orders,
+        catalog,
+    ) -> RecommendationSpec:
+        return self.result
+
+
+def goal_understanding(
+    *,
+    query: str = "通勤",
+    intents: list[str] | None = None,
+) -> GoalUnderstandingResult:
+    ordered_intents = intents or ["product_recommendation"]
+    return GoalUnderstandingResult(
+        primary_intent=ordered_intents[0],
+        intents=ordered_intents,
+        pending_intents=ordered_intents[1:],
+        goal=f"推荐与 {query} 相关的商品",
+        confidence=0.95,
+        slots={
+            "query": query,
+            "max_price_cents": 30000,
+            "scenario": "self",
+        },
+        pending_intent_question=(
+            "当前已处理第一个意图。需要我继续处理后续意图吗？"
+            if len(ordered_intents) > 1
+            else None
+        ),
+    )
+
+
+def recommendation_spec(
+    *,
+    queries: list[str] | None = None,
+) -> RecommendationSpec:
+    return RecommendationSpec(
+        goal_summary="推荐预算 300 元以内的通勤商品",
+        hard_constraints=RecommendationSpecHardConstraints(
+            max_price_cents=30000,
+        ),
+        preferred_categories=["箱包"],
+        preferred_tags=["通勤"],
+        search_queries=queries or ["通勤", "办公室"],
+        scenario="self",
+        usage="通勤",
+        source_evidence=[],
+        confidence=0.9,
+    )
 
 
 def scored_candidate(
@@ -347,10 +446,12 @@ def test_get_product_tool_returns_stock() -> None:
 
 def test_create_order_tool_creates_pending_order_and_returns_preview() -> None:
     context = ShoppingAgentContext(mall=mall_client(), turn_id="turn-order")
+    context.goal_understanding = goal_understanding()
+    prepare_recommendation_context(context)
     invoke_tool(
         context,
         "recommend_products",
-        {"query": "通勤", "max_price_cents": 30000},
+        {},
     )
 
     created = json.loads(
@@ -398,14 +499,209 @@ def test_create_order_rejects_product_outside_known_recommendations() -> None:
     assert result["status"] == "rejected"
 
 
+def test_understand_goal_action_returns_first_intent_and_pending_intents() -> None:
+    context = ShoppingAgentContext(
+        mall=mall_client(),
+        current_user_request="推荐一个通勤包，然后查一下我的订单",
+    )
+    context.goal_understander = StaticGoalUnderstander(
+        goal_understanding(
+            intents=["product_recommendation", "order_query"],
+        )
+    )
+
+    result = json.loads(
+        invoke_tool(context, "understand_goal", {})
+    )
+
+    assert result["status"] == "understood"
+    assert result["goal_understanding"]["primary_intent"] == (
+        "product_recommendation"
+    )
+    assert result["goal_understanding"]["pending_intents"] == ["order_query"]
+    assert context.goal_understanding is not None
+
+
+def test_goal_understanding_agent_uses_its_own_prompt() -> None:
+    model = ScriptedModel(
+        [
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "intents": [
+                                "product_recommendation",
+                                "order_query",
+                            ],
+                            "goal": "推荐通勤包并查询订单",
+                            "confidence": 0.96,
+                            "slots": {"query": "通勤"},
+                            "missing_slots": [],
+                            "requires_clarification": False,
+                            "clarification_question": None,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ]
+        ]
+    )
+    understander = AgentGoalUnderstander(
+        config=llm_config(),
+        model=model,
+    )
+
+    result = asyncio.run(
+        understander.understand(
+            current_message="推荐一个通勤包，然后查订单",
+            recent_messages=[
+                ConversationMessage(
+                    role="user",
+                    content="推荐一个通勤包，然后查订单",
+                )
+            ],
+            previous_goal=None,
+            previous_recommendations=[],
+            previous_orders=[],
+        )
+    )
+
+    assert result.primary_intent == "product_recommendation"
+    assert result.pending_intents == ["order_query"]
+    assert model.first_call is not None
+    assert "Goal Understanding" in (
+        model.first_call.system_instructions or ""
+    )
+
+
+def test_collect_context_and_generate_recommendation_spec_are_separate_actions() -> None:
+    context = ShoppingAgentContext(mall=mall_client())
+    context.goal_understanding = goal_understanding()
+    context.recommendation_spec_generator = StaticRecommendationSpecGenerator(
+        recommendation_spec()
+    )
+
+    collected = json.loads(
+        invoke_tool(context, "collect_recommendation_context", {})
+    )
+    generated = json.loads(
+        invoke_tool(context, "generate_recommendation_spec", {})
+    )
+
+    assert collected["status"] == "collected"
+    assert collected["browse_count"] > 0
+    assert generated["status"] == "generated"
+    assert context.recommendation_spec is not None
+    assert context.recommendation_spec.search_queries == ["通勤", "办公室"]
+
+
+def test_organic_and_ad_search_actions_cache_candidates_independently() -> None:
+    context = ShoppingAgentContext(mall=mall_client())
+    context.goal_understanding = goal_understanding()
+    invoke_tool(context, "collect_recommendation_context", {})
+    context.recommendation_spec = recommendation_spec()
+
+    organic = json.loads(
+        invoke_tool(context, "search_organic_candidates", {})
+    )
+    assert organic["status"] == "searched"
+    assert context.organic_search_attempted is True
+    assert context.organic_search_products
+    assert context.ad_search_attempted is False
+
+    ads = json.loads(
+        invoke_tool(context, "search_ad_candidates", {})
+    )
+    assert ads["status"] == "searched"
+    assert context.ad_search_attempted is True
+    assert context.ad_search_candidates
+    assert ads["source_status"] == "ok_with_data"
+
+
+def test_recommendation_spec_agent_uses_own_prompt_and_explicit_constraints() -> None:
+    context = ShoppingAgentContext(mall=mall_client())
+    context.goal_understanding = goal_understanding()
+    invoke_tool(context, "collect_recommendation_context", {})
+    snapshot = context.recommendation_context
+    assert snapshot is not None
+    model = ScriptedModel(
+        [
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "goal_summary": "寻找通勤商品",
+                            "hard_constraints": {
+                                "category": None,
+                                "min_price_cents": None,
+                                "max_price_cents": 50000,
+                                "required_tags": [],
+                                "excluded_tags": [],
+                            },
+                            "preferred_categories": ["箱包"],
+                            "preferred_tags": ["通勤", "轻便"],
+                            "weak_categories": ["家居"],
+                            "negative_tags": [],
+                            "search_queries": ["通勤包", "轻便通勤包"],
+                            "scenario": "self",
+                            "usage": "通勤",
+                            "recipient": None,
+                            "source_evidence": [
+                                {
+                                    "source": "cart",
+                                    "observation": "购物车中有通勤双肩包",
+                                    "influence": "high",
+                                }
+                            ],
+                            "confidence": 0.92,
+                            "missing_information": [],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ]
+        ]
+    )
+    generator = AgentRecommendationSpecGenerator(
+        config=llm_config(),
+        model=model,
+    )
+
+    spec = asyncio.run(
+        generator.generate(
+            goal=context.goal_understanding,
+            agent_profile=snapshot.agent_profile,
+            platform_profile=snapshot.platform_profile,
+            cart=snapshot.cart,
+            browse_history=snapshot.browse_history,
+            orders=snapshot.orders,
+            catalog=snapshot.catalog,
+        )
+    )
+
+    assert spec.hard_constraints.max_price_cents == 30000
+    assert spec.search_queries == ["通勤包", "轻便通勤包"]
+    assert model.first_call is not None
+    assert "Recommendation SPEC Generator" in (
+        model.first_call.system_instructions or ""
+    )
+
+
 def test_recommend_products_formula_path_selects_top_two() -> None:
     context = ShoppingAgentContext(mall=mall_client(), user_id=999)
+    context.goal_understanding = goal_understanding(query="家居")
+    prepare_recommendation_context(
+        context,
+        spec=recommendation_spec(queries=["家居", "居家"]),
+    )
+    context.ad_search_candidates = []
+    context.ad_search_status = "ok_empty"
 
     result = json.loads(
         invoke_tool(
             context,
             "recommend_products",
-            {"query": "家居"},
+            {},
         )
     )
 
@@ -421,12 +717,24 @@ def test_recommend_products_formula_path_selects_top_two() -> None:
 
 def test_recommend_products_returns_no_match_without_eligible_candidates() -> None:
     context = ShoppingAgentContext(mall=mall_client(), user_id=999)
+    context.goal_understanding = goal_understanding(query="宠物用品")
+    no_match_spec = recommendation_spec(queries=["宠物用品"]).model_copy(
+        update={
+            "preferred_categories": [],
+            "preferred_tags": [],
+            "usage": None,
+        }
+    )
+    prepare_recommendation_context(
+        context,
+        spec=no_match_spec,
+    )
 
     result = json.loads(
         invoke_tool(
             context,
             "recommend_products",
-            {"query": "宠物用品"},
+            {},
         )
     )
 
@@ -675,10 +983,97 @@ def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
                     call_id="call-plan",
                 ),
                 function_call(
-                    "recommend_products",
-                    {"query": "通勤", "max_price_cents": 30000},
-                    call_id="call-recommend",
+                    "understand_goal",
+                    {},
+                    call_id="call-goal",
                 ),
+            ],
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "intents": ["product_recommendation"],
+                            "goal": "推荐预算 300 元以内的通勤商品",
+                            "confidence": 0.96,
+                            "slots": {
+                                "query": "通勤",
+                                "max_price_cents": 30000,
+                                "scenario": "self",
+                            },
+                            "missing_slots": [],
+                            "requires_clarification": False,
+                            "clarification_question": None,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ],
+            [
+                function_call(
+                    "collect_recommendation_context",
+                    {},
+                    call_id="call-context",
+                )
+            ],
+            [
+                function_call(
+                    "generate_recommendation_spec",
+                    {},
+                    call_id="call-spec",
+                )
+            ],
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "goal_summary": "推荐 300 元以内通勤商品",
+                            "hard_constraints": {
+                                "category": None,
+                                "min_price_cents": None,
+                                "max_price_cents": 30000,
+                                "required_tags": [],
+                                "excluded_tags": [],
+                            },
+                            "preferred_categories": ["箱包"],
+                            "preferred_tags": ["通勤"],
+                            "weak_categories": [],
+                            "negative_tags": [],
+                            "search_queries": ["通勤", "办公室"],
+                            "scenario": "self",
+                            "usage": "通勤",
+                            "recipient": None,
+                            "source_evidence": [
+                                {
+                                    "source": "cart",
+                                    "observation": "购物车中有通勤双肩包",
+                                    "influence": "high",
+                                }
+                            ],
+                            "confidence": 0.92,
+                            "missing_information": [],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ],
+            [
+                function_call(
+                    "search_organic_candidates",
+                    {},
+                    call_id="call-organic-search",
+                ),
+                function_call(
+                    "search_ad_candidates",
+                    {},
+                    call_id="call-ad-search",
+                ),
+            ],
+            [
+                function_call(
+                    "recommend_products",
+                    {},
+                    call_id="call-recommend",
+                )
             ],
             [
                 function_call(
@@ -749,10 +1144,13 @@ def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
     assert plan_state["step_states"][0]["status"] == "in_progress"
     assert plan_state["revision"] == 1
     assert model.last_call is not None
-    assert len(model.last_call.tools) == 14
+    assert len(model.last_call.tools) == 19
     assert model.first_call is not None
     assert "小牛导购" in (model.first_call.system_instructions or "")
     assert "独立语义终排" in (
+        model.first_call.system_instructions or ""
+    )
+    assert "pending_intent_question" in (
         model.first_call.system_instructions or ""
     )
 

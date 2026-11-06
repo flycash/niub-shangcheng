@@ -8,6 +8,7 @@ from .models import (
     Product,
     ProductCandidate,
     ProductList,
+    RecommendationSpec,
     ShoppingCart,
 )
 
@@ -22,6 +23,12 @@ class MallGateway(Protocol):
         max_price_cents: int | None = None,
         min_price_cents: int | None = None,
         limit: int = 5,
+    ) -> list[Product]: ...
+
+    async def search_organic_with_spec(
+        self,
+        spec: RecommendationSpec,
+        limit: int = 10,
     ) -> list[Product]: ...
 
     async def get_product(self, product_id: str) -> Product | None: ...
@@ -61,6 +68,12 @@ class MallGateway(Protocol):
         query: str = "",
         category: str | None = None,
         max_price_cents: int | None = None,
+        limit: int = 10,
+    ) -> list[ProductCandidate]: ...
+
+    async def search_ads_with_spec(
+        self,
+        spec: RecommendationSpec,
         limit: int = 10,
     ) -> list[ProductCandidate]: ...
 

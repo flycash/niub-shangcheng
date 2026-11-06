@@ -185,6 +185,11 @@ const priceFormatter = new Intl.NumberFormat("zh-CN", {
 
 const toolLabels: Record<string, string> = {
   update_plan: "更新 Plan",
+  understand_goal: "理解用户目标与意图",
+  collect_recommendation_context: "收集推荐上下文",
+  generate_recommendation_spec: "生成推荐 SPEC",
+  search_organic_candidates: "搜索自然商品",
+  search_ad_candidates: "搜索广告商品",
   get_agent_profile: "读取 Agent 画像",
   get_platform_profile: "读取平台画像",
   get_browse_history: "读取浏览记录",

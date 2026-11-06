@@ -154,3 +154,47 @@ class AdRecommendationRequest(BaseModel):
     category: str | None = Field(default=None, max_length=50)
     max_price_cents: int | None = Field(default=None, ge=0)
     limit: int = Field(default=10, ge=1, le=10)
+
+
+class RecommendationSpecHardConstraints(BaseModel):
+    category: str | None = Field(default=None, max_length=100)
+    min_price_cents: int | None = Field(default=None, ge=0)
+    max_price_cents: int | None = Field(default=None, ge=0)
+    required_tags: list[str] = Field(default_factory=list)
+    excluded_tags: list[str] = Field(default_factory=list)
+
+
+class RecommendationSpecEvidence(BaseModel):
+    source: str = Field(min_length=1, max_length=100)
+    observation: str = Field(min_length=1, max_length=500)
+    influence: Literal["high", "medium", "low"]
+
+
+class RecommendationSearchSpec(BaseModel):
+    goal_summary: str = Field(min_length=1, max_length=1_000)
+    hard_constraints: RecommendationSpecHardConstraints = Field(
+        default_factory=RecommendationSpecHardConstraints
+    )
+    preferred_categories: list[str] = Field(default_factory=list)
+    preferred_tags: list[str] = Field(default_factory=list)
+    weak_categories: list[str] = Field(default_factory=list)
+    negative_tags: list[str] = Field(default_factory=list)
+    search_queries: list[str] = Field(min_length=1, max_length=6)
+    scenario: Literal[
+        "general",
+        "self",
+        "gift",
+        "replenishment",
+    ] = "general"
+    usage: str | None = Field(default=None, max_length=500)
+    recipient: str | None = Field(default=None, max_length=200)
+    source_evidence: list[RecommendationSpecEvidence] = Field(
+        default_factory=list
+    )
+    confidence: float = Field(ge=0, le=1)
+    missing_information: list[str] = Field(default_factory=list)
+
+
+class RecommendationSearchRequest(BaseModel):
+    spec: RecommendationSearchSpec
+    limit: int = Field(default=10, ge=1, le=20)

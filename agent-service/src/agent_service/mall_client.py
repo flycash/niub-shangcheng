@@ -12,6 +12,7 @@ from .models import (
     Product,
     ProductCandidate,
     ProductList,
+    RecommendationSpec,
     ShoppingCart,
 )
 
@@ -140,6 +141,22 @@ class MallClient:
         catalog = self._validate(ProductList, payload)
         return catalog.items
 
+    async def search_organic_with_spec(
+        self,
+        spec: RecommendationSpec,
+        limit: int = 10,
+    ) -> list[Product]:
+        payload = await self._request(
+            "POST",
+            "/api/search/organic",
+            json={
+                "spec": spec.model_dump(mode="json"),
+                "limit": max(1, min(limit, 20)),
+            },
+        )
+        catalog = self._validate(ProductList, payload)
+        return catalog.items
+
     async def get_product(self, product_id: str) -> Product | None:
         try:
             payload = await self._request("GET", f"/api/products/{product_id}")
@@ -228,6 +245,21 @@ class MallClient:
                 "category": category,
                 "max_price_cents": max_price_cents,
                 "limit": max(1, min(limit, 10)),
+            },
+        )
+        return self._validate(RecommendationResponse, payload).items
+
+    async def search_ads_with_spec(
+        self,
+        spec: RecommendationSpec,
+        limit: int = 10,
+    ) -> list[ProductCandidate]:
+        payload = await self._request(
+            "POST",
+            "/api/search/ads",
+            json={
+                "spec": spec.model_dump(mode="json"),
+                "limit": max(1, min(limit, 20)),
             },
         )
         return self._validate(RecommendationResponse, payload).items

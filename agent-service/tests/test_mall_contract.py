@@ -4,6 +4,10 @@ import httpx
 from mall_service.api import app as mall_app
 
 from agent_service.mall_client import MallClient
+from agent_service.models import (
+    RecommendationSpec,
+    RecommendationSpecHardConstraints,
+)
 
 
 def test_agent_can_read_mall_catalog_api() -> None:
@@ -50,3 +54,32 @@ def test_agent_can_read_user_context_and_recommendations() -> None:
     assert profile is not None
     assert len(products) <= 3
     assert len(ads) <= 10
+
+
+def test_agent_passes_whole_spec_to_mock_es_search() -> None:
+    client = mall_client()
+    spec = RecommendationSpec(
+        goal_summary="寻找通勤商品",
+        hard_constraints=RecommendationSpecHardConstraints(
+            max_price_cents=30000,
+        ),
+        preferred_categories=["箱包"],
+        preferred_tags=["通勤"],
+        search_queries=["通勤", "办公室"],
+        scenario="self",
+        usage="通勤",
+        confidence=0.9,
+    )
+
+    async def search():
+        return (
+            await client.search_organic_with_spec(spec, limit=5),
+            await client.search_ads_with_spec(spec, limit=3),
+        )
+
+    products, ads = asyncio.run(search())
+
+    assert products
+    assert all(product.price_cents <= 30000 for product in products)
+    assert ads
+    assert all(item.source == "advertisement" for item in ads)

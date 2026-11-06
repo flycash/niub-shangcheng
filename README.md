@@ -90,14 +90,17 @@ Agent 提示词保存在：
 
 ```text
 agent-service/prompts/shopping_agent.md
+agent-service/prompts/goal_understanding.md
+agent-service/prompts/recommendation_spec.md
 agent-service/prompts/recommendation_reranker.md
 ```
 
-主 Agent 和语义终排 Agent 各自在所属模块中声明 Prompt 路径，并通过
+主 Agent、Goal Understanding Agent 和语义终排 Agent 各自在所属模块中声明
+Prompt 路径，并通过
 [`prompt_loader.py`](agent-service/src/agent_service/prompt_loader.py)
 提供的通用 `load_prompt(path)` 读取文件。YAML 不保存 Prompt 路径。提示词在每次
 请求时重新读取，因此修改 Markdown 后下一轮对话立即生效，不需要重启服务。提示词
-文件限制为 UTF-8、内容非空且不超过 64 KiB。
+文件限制为 UTF-8、内容非空且不超过 1 MiB。
 
 ## 服务接口
 
@@ -113,6 +116,8 @@ agent-service/prompts/recommendation_reranker.md
 - 平台画像：`GET http://localhost:8001/api/users/{user_id}/platform-profile`
 - 商品推荐：`POST http://localhost:8001/api/recommendations/products`
 - 广告推荐：`POST http://localhost:8001/api/recommendations/ads`
+- SPEC 自然商品检索：`POST http://localhost:8001/api/search/organic`
+- SPEC 广告检索：`POST http://localhost:8001/api/search/ads`
 - Agent 健康检查：`GET http://localhost:8002/health`
 - Agent 对话：`POST http://localhost:8002/api/chat`
 - Agent SSE 多轮对话：`POST http://localhost:8002/api/chat/stream`
@@ -155,8 +160,17 @@ pnpm --dir web build
 当前固定演示用户为 `user_id = 1`。Agent 工具包括：
 
 - `update_plan`：由模型创建或整体替换 Plan 和 Plan State。
-- `recommend_products`：并行读取画像、浏览、订单、购物车和两路候选，按统一
-  公式生成自然商品 Top 10 与广告 Top 3，并执行阈值分路。
+- `understand_goal`：独立 Goal Understanding Action，使用单独 Prompt 和模型
+  调用识别多意图、提取槽位，并确定本轮第一个待处理意图。
+- `collect_recommendation_context`：为 Recommendation SPEC 收集画像、购物车、
+  浏览记录、订单和商品目录，不向主 Agent暴露原始行为数据。
+- `generate_recommendation_spec`：独立 SPEC Action，根据 Goal Understanding 和
+  用户行为生成查询变体、硬约束、推断偏好及证据。
+- `search_organic_candidates`：独立自然商品搜索 Action，只使用 SPEC 搜索并缓存
+  自然候选，将完整 SPEC 发送给 `mall-service`。
+- `search_ad_candidates`：独立广告搜索 Action，只使用 SPEC 搜索并缓存广告候选。
+- `recommend_products`：读取两路搜索 Action 的缓存结果，结合用户行为按统一公式
+  生成自然商品 Top 10 与广告 Top 3，并执行阈值分路。
 - `rerank_recommendations`：独立的语义终排工具，使用单独 Prompt 综合公式分数、
   商品语义和可信环境信息，最多选择两个自然商品和一个广告商品。
 - `get_agent_profile`：读取 Agent 自己维护的用户画像。
@@ -174,6 +188,11 @@ pnpm --dir web build
 模型仍需自行决定如何使用它。Plan State 通过 SSE 的 `plan_updated` 事件实时更新，
 并随助手消息保存到 SQLite。
 
+多意图消息由 `understand_goal` 保留完整意图顺序，但每轮只处理第一个意图。如果
+还有待处理意图，主 Agent 在完成第一个目标后询问用户是否继续；用户确认后，下一轮
+继续处理第一个 `pending_intent`。Goal Understanding 结果会随助手消息保存，用于
+恢复待处理意图。
+
 所有记录和广告 Mock 数据均位于 `mall-service`。自然推荐和广告分别使用统一公式
 评分；广告最高分严格高于自然 Top 10 最低分时，最多三个达标广告与自然候选一起
 进入独立语义终排。最终最多两个自然商品和一个广告，存在自然商品时广告不能排在
@@ -182,6 +201,14 @@ pnpm --dir web build
 `tool_completed`、`recommendations`、`delta` 和 `done` 事件。终排完成后，工具
 结果会返回主 Agent，由主 Agent 继续生成最终文字回答，并在文字后展示可点击的
 商品卡片。推荐商品同时作为内部元数据保存，以支持“第一个商品”等后续指代和下单。
+
+推荐召回前会先生成 Recommendation SPEC。搜索与广告搜索共同使用 SPEC 中的硬约束
+和查询变体；SPEC 中的行为推断只指导召回，候选评分仍由统一公式计算，避免同一信号
+重复计权。SPEC 结果会持久化用于诊断。
+
+两个搜索 Action 都把完整 SPEC 发送给 `mall-service`。`mall-service` 目前不连接
+真实 Elasticsearch，而是把 SPEC 转换为模拟 ES DSL，通过日志打印完整查询条件，
+然后使用本地商品目录返回 mock 检索结果。
 
 ## 购买与订单预览
 

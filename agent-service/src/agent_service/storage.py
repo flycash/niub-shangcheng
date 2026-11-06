@@ -9,9 +9,11 @@ from uuid import uuid4
 from .models import (
     ConversationDetail,
     ConversationSummary,
+    GoalUnderstandingResult,
     OrderLink,
     PlanState,
     Product,
+    RecommendationSpec,
     StoredMessage,
     ToolTrace,
 )
@@ -289,6 +291,22 @@ class ConversationStore:
                 plan_state = PlanState.model_validate(metadata["plan_state"])
             except ValueError:
                 plan_state = None
+        goal_understanding: GoalUnderstandingResult | None = None
+        if isinstance(metadata.get("goal_understanding"), dict):
+            try:
+                goal_understanding = GoalUnderstandingResult.model_validate(
+                    metadata["goal_understanding"]
+                )
+            except ValueError:
+                goal_understanding = None
+        recommendation_spec: RecommendationSpec | None = None
+        if isinstance(metadata.get("recommendation_spec"), dict):
+            try:
+                recommendation_spec = RecommendationSpec.model_validate(
+                    metadata["recommendation_spec"]
+                )
+            except ValueError:
+                recommendation_spec = None
         orders = [
             OrderLink.model_validate(order)
             for order in metadata.get("orders", [])
@@ -303,6 +321,8 @@ class ConversationStore:
             recommendations=recommendations,
             tool_trace=tool_trace,
             plan_state=plan_state,
+            goal_understanding=goal_understanding,
+            recommendation_spec=recommendation_spec,
             orders=orders,
         )
 

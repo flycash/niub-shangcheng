@@ -16,6 +16,7 @@ from .models import (
     Product,
     ProductList,
     ProductRecommendationRequest,
+    RecommendationSearchRequest,
     RecommendationResponse,
 )
 from .orders import (
@@ -28,6 +29,7 @@ from .orders import (
     pay_order,
 )
 from .recommendations import recommend_ads, recommend_products
+from .search import search_mock_ads_with_spec, search_mock_with_spec
 
 app = FastAPI(title="Mall Service", version="0.1.0")
 
@@ -155,3 +157,32 @@ def get_ad_recommendations(
     request: AdRecommendationRequest,
 ) -> RecommendationResponse:
     return RecommendationResponse(items=recommend_ads(request))
+
+
+@app.post(
+    "/api/search/organic",
+    response_model=ProductList,
+)
+def search_organic_with_spec(
+    request: RecommendationSearchRequest,
+) -> ProductList:
+    products = search_mock_with_spec(
+        request.spec,
+        channel="organic",
+        limit=request.limit,
+    )
+    return ProductList(items=products, total=len(products))
+
+
+@app.post(
+    "/api/search/ads",
+    response_model=RecommendationResponse,
+)
+def search_ads_with_spec(
+    request: RecommendationSearchRequest,
+) -> RecommendationResponse:
+    candidates = search_mock_ads_with_spec(
+        request.spec,
+        limit=request.limit,
+    )
+    return RecommendationResponse(items=candidates)

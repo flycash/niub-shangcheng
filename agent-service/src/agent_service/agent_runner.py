@@ -25,6 +25,11 @@ from openai import AsyncOpenAI
 from openai.types.responses import ResponseTextDeltaEvent
 
 from .agent_profile import get_agent_profile
+from .goal_understanding import (
+    AgentGoalUnderstander,
+    GoalUnderstander,
+    GoalUnderstandingError,
+)
 from .llm_config import LLMConfig
 from .mall_client import MallRequestError
 from .mall_gateway import MallGateway
@@ -34,6 +39,7 @@ from .models import (
     BrowseEvent,
     ConversationMessage,
     CreateOrderItem,
+    GoalUnderstandingResult,
     OrderLink,
     OrderRecord,
     Plan,
@@ -42,8 +48,10 @@ from .models import (
     PlatformProfile,
     Product,
     ProductCandidate,
+    ProductList,
     RecommendationBatch,
     RecommendationDemand,
+    RecommendationSpec,
     ScoredProduct,
     SemanticRankingResult,
     ShoppingCart,
@@ -59,6 +67,11 @@ from .recommendation_reranker import (
     validate_semantic_ranking,
 )
 from .recommendation_scoring import build_recommendation_batch
+from .recommendation_spec import (
+    AgentRecommendationSpecGenerator,
+    RecommendationSpecError,
+    RecommendationSpecGenerator,
+)
 
 logger = logging.getLogger(__name__)
 set_tracing_disabled(True)
@@ -83,11 +96,39 @@ def normalize_openai_base_url(base_url: str) -> str:
 
 
 @dataclass
+class RecommendationContextSnapshot:
+    agent_profile: AgentProfile | None
+    platform_profile: PlatformProfile | None
+    browse_history: list[BrowseEvent]
+    orders: list[OrderRecord]
+    cart: ShoppingCart
+    catalog: ProductList
+    source_statuses: dict[str, SourceStatus]
+
+
+@dataclass
 class ShoppingAgentContext:
     mall: MallGateway
     user_id: int = DEMO_USER_ID
     turn_id: str = ""
     current_user_request: str = ""
+    conversation_messages: tuple[ConversationMessage, ...] = ()
+    previous_recommendations: tuple[Product, ...] = ()
+    previous_orders: tuple[OrderLink, ...] = ()
+    previous_goal_understanding: GoalUnderstandingResult | None = None
+    goal_understanding: GoalUnderstandingResult | None = None
+    goal_understander: GoalUnderstander | None = None
+    recommendation_context: RecommendationContextSnapshot | None = None
+    recommendation_spec: RecommendationSpec | None = None
+    recommendation_spec_generator: RecommendationSpecGenerator | None = None
+    organic_search_attempted: bool = False
+    organic_search_products: list[Product] = field(default_factory=list)
+    organic_search_statuses: dict[str, SourceStatus] = field(
+        default_factory=dict
+    )
+    ad_search_attempted: bool = False
+    ad_search_candidates: list[ProductCandidate] = field(default_factory=list)
+    ad_search_status: SourceStatus = "ok_empty"
     plan_state: PlanState | None = None
     candidate_products: dict[str, Product] = field(default_factory=dict)
     organic_product_ids: set[str] = field(default_factory=set)
@@ -197,11 +238,102 @@ def order_items_signature(items: Sequence[CreateOrderItem]) -> str:
     ).hexdigest()
 
 
+def _optional_string(slots: dict[str, object], key: str) -> str | None:
+    value = slots.get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _optional_int(slots: dict[str, object], key: str) -> int | None:
+    value = slots.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def recommendation_demand_from_goal(
+    goal: GoalUnderstandingResult,
+    spec: RecommendationSpec | None = None,
+) -> RecommendationDemand:
+    slots = goal.slots
+    hard = spec.hard_constraints if spec is not None else None
+    required_tags = slots.get("required_tags")
+    excluded_tags = slots.get("excluded_tags")
+    scenario = slots.get("scenario")
+    if scenario not in {"general", "self", "gift", "replenishment"}:
+        scenario = spec.scenario if spec is not None else "general"
+    query = _optional_string(slots, "query")
+    if query is None and goal.primary_intent == "product_recommendation":
+        query = (
+            spec.search_queries[0]
+            if spec is not None and spec.search_queries
+            else goal.goal
+        )
+    explicit_required = (
+        [
+            value
+            for value in required_tags
+            if isinstance(value, str) and value.strip()
+        ]
+        if isinstance(required_tags, list)
+        else []
+    )
+    explicit_excluded = (
+        [
+            value
+            for value in excluded_tags
+            if isinstance(value, str) and value.strip()
+        ]
+        if isinstance(excluded_tags, list)
+        else []
+    )
+    spec_required = hard.required_tags if hard is not None else []
+    spec_excluded = hard.excluded_tags if hard is not None else []
+    return RecommendationDemand(
+        query=query or "",
+        category=(
+            _optional_string(slots, "category")
+            or (hard.category if hard is not None else None)
+        ),
+        min_price_cents=(
+            _optional_int(slots, "min_price_cents")
+            if _optional_int(slots, "min_price_cents") is not None
+            else (hard.min_price_cents if hard is not None else None)
+        ),
+        max_price_cents=(
+            _optional_int(slots, "max_price_cents")
+            if _optional_int(slots, "max_price_cents") is not None
+            else (hard.max_price_cents if hard is not None else None)
+        ),
+        required_tags=explicit_required or spec_required,
+        excluded_tags=list(dict.fromkeys([*explicit_excluded, *spec_excluded])),
+        scenario=scenario,
+        usage=(
+            _optional_string(slots, "usage")
+            or (spec.usage if spec is not None else None)
+        ),
+        recipient=(
+            _optional_string(slots, "recipient")
+            or (spec.recipient if spec is not None else None)
+        ),
+    )
+
+
+def _source_status(value: object, *, empty: bool = False) -> SourceStatus:
+    if isinstance(value, BaseException):
+        return "unavailable"
+    return "ok_empty" if empty else "ok_with_data"
+
+
 def instructions_with_plan_state(
     instructions: str,
     plan_state: PlanState | None,
     previous_recommendations: Sequence[Product] = (),
     previous_orders: Sequence[OrderLink] = (),
+    previous_goal_understanding: GoalUnderstandingResult | None = None,
 ) -> str:
     if plan_state is None:
         plan_context = "当前没有已保存的 Plan State。"
@@ -225,6 +357,11 @@ def instructions_with_plan_state(
     order_context = [
         order.model_dump(mode="json") for order in previous_orders
     ]
+    goal_context = (
+        previous_goal_understanding.model_dump(mode="json")
+        if previous_goal_understanding is not None
+        else None
+    )
     return (
         f"{instructions}\n\n"
         "## 当前保存的 Plan State\n\n"
@@ -238,6 +375,9 @@ def instructions_with_plan_state(
         f"```json\n{json.dumps(recommendation_context, ensure_ascii=False, indent=2)}\n```\n\n"
         "## 最近创建的订单\n\n"
         f"```json\n{json.dumps(order_context, ensure_ascii=False, indent=2)}\n```"
+        "\n\n## 上一轮 Goal Understanding\n\n"
+        "以下内容是上一轮的独立理解结果，可用于识别待处理的多意图。\n\n"
+        f"```json\n{json.dumps(goal_context, ensure_ascii=False, indent=2)}\n```"
     )
 
 
@@ -245,8 +385,14 @@ def create_tools(
     context: ShoppingAgentContext,
     config: LLMConfig,
     *,
+    goal_understander: GoalUnderstander | None = None,
+    recommendation_spec_generator: RecommendationSpecGenerator | None = None,
     semantic_reranker: SemanticReranker | None = None,
 ) -> list[Any]:
+    if goal_understander is not None:
+        context.goal_understander = goal_understander
+    if recommendation_spec_generator is not None:
+        context.recommendation_spec_generator = recommendation_spec_generator
     if semantic_reranker is not None:
         context.semantic_reranker = semantic_reranker
     tool_options = {
@@ -555,70 +701,84 @@ def create_tools(
         )
 
     @function_tool(
-        name_override="recommend_products",
+        name_override="understand_goal",
         description_override=(
-            "推荐主流程。并行读取用户画像、浏览、订单和购物车，使用统一公式"
-            "分别生成自然商品 Top 10 和广告 Top 3。广告分数严格高于自然"
-            "最低分时返回 requires_semantic_ranking，否则直接提交自然 Top 2。"
-            "传入从用户当前消息提取的完整结构化需求。"
+            "独立的 Goal Understanding Action。使用单独 Prompt 和模型调用"
+            "识别一个或多个意图并提取结构化槽位。每轮用户消息都必须先调用。"
+            "本轮只处理 primary_intent；pending_intents 留给用户确认后处理。"
         ),
         **tool_options,
     )
-    async def recommend_products_tool(
-        query: str = "",
-        category: str | None = None,
-        min_price_cents: int | None = None,
-        max_price_cents: int | None = None,
-        required_tags: list[str] | None = None,
-        excluded_tags: list[str] | None = None,
-        scenario: Literal[
-            "general",
-            "self",
-            "gift",
-            "replenishment",
-        ] = "general",
-        usage: str | None = None,
-        recipient: str | None = None,
-    ) -> str:
-        demand = RecommendationDemand(
-            query=query,
-            category=category,
-            min_price_cents=min_price_cents,
-            max_price_cents=max_price_cents,
-            required_tags=required_tags or [],
-            excluded_tags=excluded_tags or [],
-            scenario=scenario,
-            usage=usage,
-            recipient=recipient,
+    async def understand_goal_tool() -> str:
+        if context.goal_understanding is not None:
+            return json.dumps(
+                {
+                    "status": "understood",
+                    "goal_understanding": (
+                        context.goal_understanding.model_dump(mode="json")
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        if context.goal_understander is None:
+            return unavailable_payload("Goal Understanding")
+        try:
+            result = await context.goal_understander.understand(
+                current_message=context.current_user_request,
+                recent_messages=list(context.conversation_messages),
+                previous_goal=context.previous_goal_understanding,
+                previous_recommendations=list(
+                    context.previous_recommendations
+                ),
+                previous_orders=list(context.previous_orders),
+            )
+        except GoalUnderstandingError as exc:
+            logger.warning("goal understanding failed: %s", exc)
+            return unavailable_payload("Goal Understanding")
+        context.goal_understanding = result
+        return json.dumps(
+            {
+                "status": "understood",
+                "goal_understanding": result.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
         )
+
+    @function_tool(
+        name_override="collect_recommendation_context",
+        description_override=(
+            "为 Recommendation SPEC 收集画像、购物车、浏览记录、订单和商品目录。"
+            "只在 primary_intent 为 product_recommendation 时调用。工具只返回"
+            "数据状态和数量，原始行为供独立 SPEC Action 使用。"
+        ),
+        **tool_options,
+    )
+    async def collect_recommendation_context_tool() -> str:
+        goal = context.goal_understanding
+        if goal is None:
+            return rejected("请先调用 understand_goal")
+        if goal.primary_intent != "product_recommendation":
+            return rejected("当前 primary_intent 不是商品推荐")
+        if context.recommendation_context is not None:
+            snapshot = context.recommendation_context
+            return json.dumps(
+                {
+                    "status": "collected",
+                    "browse_count": len(snapshot.browse_history),
+                    "order_count": len(snapshot.orders),
+                    "cart_count": len(snapshot.cart.items),
+                    "catalog_count": len(snapshot.catalog.items),
+                    "source_statuses": snapshot.source_statuses,
+                },
+                ensure_ascii=False,
+            )
+
         agent_profile = get_agent_profile(context.user_id)
         results = await asyncio.gather(
             context.mall.get_platform_profile(context.user_id),
             context.mall.get_browse_history(context.user_id, 20),
             context.mall.get_orders(context.user_id, 20),
             context.mall.get_cart(context.user_id),
-            context.mall.get_product_recommendations(
-                context.user_id,
-                query=query,
-                category=category,
-                min_price_cents=min_price_cents,
-                max_price_cents=max_price_cents,
-                limit=10,
-            ),
-            context.mall.search_products(
-                query=query,
-                category=category,
-                min_price_cents=min_price_cents,
-                max_price_cents=max_price_cents,
-                limit=10,
-            ),
-            context.mall.get_ad_recommendations(
-                context.user_id,
-                query=query,
-                category=category,
-                max_price_cents=max_price_cents,
-                limit=10,
-            ),
             context.mall.list_products(),
             return_exceptions=True,
         )
@@ -627,116 +787,248 @@ def create_tools(
             browse_result,
             orders_result,
             cart_result,
-            recommendations_result,
-            search_result,
-            ads_result,
             catalog_result,
         ) = results
-
-        def source_status(value: object, *, empty: bool = False) -> SourceStatus:
-            if isinstance(value, BaseException):
-                return "unavailable"
-            return "ok_empty" if empty else "ok_with_data"
-
+        platform_profile = (
+            platform_result
+            if isinstance(platform_result, PlatformProfile)
+            else None
+        )
+        browse_history = (
+            browse_result if isinstance(browse_result, list) else []
+        )
+        orders = orders_result if isinstance(orders_result, list) else []
+        cart = (
+            cart_result
+            if isinstance(cart_result, ShoppingCart)
+            else ShoppingCart()
+        )
+        catalog = (
+            catalog_result
+            if isinstance(catalog_result, ProductList)
+            else ProductList(items=[], total=0)
+        )
         source_statuses: dict[str, SourceStatus] = {
             "agent_profile": (
                 "ok_with_data" if agent_profile is not None else "ok_empty"
             ),
-            "platform_profile": source_status(
+            "platform_profile": _source_status(
                 platform_result,
-                empty=platform_result is None,
+                empty=platform_profile is None,
             ),
-            "browse": source_status(
+            "browse": _source_status(
                 browse_result,
-                empty=not browse_result if isinstance(browse_result, list) else False,
+                empty=not browse_history,
             ),
-            "orders": source_status(
+            "orders": _source_status(
                 orders_result,
-                empty=not orders_result if isinstance(orders_result, list) else False,
+                empty=not orders,
             ),
-            "cart": source_status(
+            "cart": _source_status(
                 cart_result,
-                empty=not cart_result.items
-                if hasattr(cart_result, "items")
-                else False,
+                empty=not cart.items,
             ),
-            "recommendations": source_status(
-                recommendations_result,
-                empty=not recommendations_result
-                if isinstance(recommendations_result, list)
-                else False,
-            ),
-            "search": source_status(
-                search_result,
-                empty=not search_result
-                if isinstance(search_result, list)
-                else False,
-            ),
-            "advertisement": source_status(
-                ads_result,
-                empty=not ads_result if isinstance(ads_result, list) else False,
-            ),
-            "catalog": source_status(
+            "catalog": _source_status(
                 catalog_result,
-                empty=(
-                    not catalog_result.items
-                    if hasattr(catalog_result, "items")
-                    else False
-                ),
+                empty=not catalog.items,
             ),
         }
-
-        platform_profile: PlatformProfile | None = (
-            platform_result
-            if not isinstance(platform_result, BaseException)
-            else None
+        context.recommendation_context = RecommendationContextSnapshot(
+            agent_profile=agent_profile,
+            platform_profile=platform_profile,
+            browse_history=browse_history,
+            orders=orders,
+            cart=cart,
+            catalog=catalog,
+            source_statuses=source_statuses,
         )
-        browse_events: list[BrowseEvent] = (
-            browse_result
-            if not isinstance(browse_result, BaseException)
-            else []
-        )
-        orders: list[OrderRecord] = (
-            orders_result
-            if not isinstance(orders_result, BaseException)
-            else []
-        )
-        cart = (
-            cart_result
-            if not isinstance(cart_result, BaseException)
-            else ShoppingCart()
-        )
-        recommendation_candidates: list[ProductCandidate] = (
-            recommendations_result
-            if not isinstance(recommendations_result, BaseException)
-            else []
-        )
-        search_products_result: list[Product] = (
-            search_result
-            if not isinstance(search_result, BaseException)
-            else []
-        )
-        ad_candidates: list[ProductCandidate] = (
-            ads_result
-            if not isinstance(ads_result, BaseException)
-            else []
-        )
-        catalog = (
-            catalog_result
-            if not isinstance(catalog_result, BaseException)
-            else None
+        return json.dumps(
+            {
+                "status": "collected",
+                "browse_count": len(browse_history),
+                "order_count": len(orders),
+                "cart_count": len(cart.items),
+                "catalog_count": len(catalog.items),
+                "source_statuses": source_statuses,
+            },
+            ensure_ascii=False,
         )
 
-        organic_products: list[Product] = []
-        seen_ids: set[str] = set()
-        for candidate in recommendation_candidates:
-            if candidate.product.id not in seen_ids:
-                organic_products.append(candidate.product)
-                seen_ids.add(candidate.product.id)
-        for product in search_products_result:
-            if product.id not in seen_ids:
-                organic_products.append(product)
-                seen_ids.add(product.id)
+    @function_tool(
+        name_override="generate_recommendation_spec",
+        description_override=(
+            "独立的 Recommendation SPEC Action。根据 Goal Understanding 和已收集"
+            "的用户数据生成搜索查询变体、硬约束、推断偏好和证据。必须在商品与"
+            "广告搜索前调用，只允许处理 product_recommendation。"
+        ),
+        **tool_options,
+    )
+    async def generate_recommendation_spec_tool() -> str:
+        goal = context.goal_understanding
+        if goal is None:
+            return rejected("请先调用 understand_goal")
+        if goal.requires_clarification:
+            return rejected("Goal Understanding 表示需要先澄清关键信息")
+        if goal.primary_intent != "product_recommendation":
+            return rejected("当前 primary_intent 不是商品推荐")
+        snapshot = context.recommendation_context
+        if snapshot is None:
+            return rejected("请先调用 collect_recommendation_context")
+        if context.recommendation_spec is not None:
+            return json.dumps(
+                {
+                    "status": "generated",
+                    "recommendation_spec": (
+                        context.recommendation_spec.model_dump(mode="json")
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        if context.recommendation_spec_generator is None:
+            return unavailable_payload("Recommendation SPEC")
+        try:
+            spec = await context.recommendation_spec_generator.generate(
+                goal=goal,
+                agent_profile=snapshot.agent_profile,
+                platform_profile=snapshot.platform_profile,
+                cart=snapshot.cart,
+                browse_history=snapshot.browse_history,
+                orders=snapshot.orders,
+                catalog=snapshot.catalog,
+            )
+        except RecommendationSpecError as exc:
+            logger.warning("recommendation SPEC generation failed: %s", exc)
+            return unavailable_payload("Recommendation SPEC")
+        context.recommendation_spec = spec
+        return json.dumps(
+            {
+                "status": "generated",
+                "recommendation_spec": spec.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+        )
+
+    @function_tool(
+        name_override="search_organic_candidates",
+        description_override=(
+            "独立的自然商品搜索 Action。只使用 Recommendation SPEC 的查询变体"
+            "和硬约束搜索自然商品，并缓存候选。不要在这里评分或生成广告候选。"
+        ),
+        **tool_options,
+    )
+    async def search_organic_candidates_tool() -> str:
+        goal = context.goal_understanding
+        snapshot = context.recommendation_context
+        spec = context.recommendation_spec
+        if goal is None or snapshot is None or spec is None:
+            return rejected(
+                "请依次完成 understand_goal、"
+                "collect_recommendation_context 和 "
+                "generate_recommendation_spec"
+            )
+        context.organic_search_attempted = True
+        context.organic_search_products = []
+        try:
+            context.organic_search_products = (
+                await context.mall.search_organic_with_spec(spec, limit=10)
+            )
+            organic_status = _source_status(
+                context.organic_search_products,
+                empty=not context.organic_search_products,
+            )
+        except Exception:
+            logger.warning("organic SPEC search failed", exc_info=True)
+            context.organic_search_products = []
+            organic_status = "unavailable"
+        context.organic_search_statuses = {
+            "organic_spec_search": organic_status,
+        }
+        context.remember_products(context.organic_search_products)
+        return json.dumps(
+            {
+                "status": "searched",
+                "count": len(context.organic_search_products),
+                "source_statuses": context.organic_search_statuses,
+            },
+            ensure_ascii=False,
+        )
+
+    @function_tool(
+        name_override="search_ad_candidates",
+        description_override=(
+            "独立的广告搜索 Action。只使用 Recommendation SPEC 的查询变体"
+            "和硬约束搜索广告商品，并缓存候选。不要在这里评分或搜索自然商品。"
+        ),
+        **tool_options,
+    )
+    async def search_ad_candidates_tool() -> str:
+        goal = context.goal_understanding
+        snapshot = context.recommendation_context
+        spec = context.recommendation_spec
+        if goal is None or snapshot is None or spec is None:
+            return rejected(
+                "请依次完成 understand_goal、"
+                "collect_recommendation_context 和 "
+                "generate_recommendation_spec"
+            )
+        context.ad_search_attempted = True
+        try:
+            context.ad_search_candidates = (
+                await context.mall.search_ads_with_spec(spec, limit=10)
+            )
+            context.ad_search_status = _source_status(
+                context.ad_search_candidates,
+                empty=not context.ad_search_candidates,
+            )
+        except Exception:
+            logger.warning("ad SPEC search failed", exc_info=True)
+            context.ad_search_candidates = []
+            context.ad_search_status = "unavailable"
+        context.remember_candidates(context.ad_search_candidates)
+        return json.dumps(
+            {
+                "status": "searched",
+                "count": len(context.ad_search_candidates),
+                "source_status": context.ad_search_status,
+            },
+            ensure_ascii=False,
+        )
+
+    @function_tool(
+        name_override="recommend_products",
+        description_override=(
+            "读取 search_organic_candidates 和 search_ad_candidates 的缓存结果，"
+            "使用已收集的用户行为数据统一评分，生成自然商品 Top 10 和广告 Top 3。"
+            "广告分数严格高于自然最低分时返回 requires_semantic_ranking，否则"
+            "直接提交自然 Top 2。必须先完成两个独立搜索 Action。"
+        ),
+        **tool_options,
+    )
+    async def recommend_products_tool() -> str:
+        goal = context.goal_understanding
+        if goal is None:
+            return rejected("请先调用 understand_goal 理解用户需求")
+        if goal.requires_clarification:
+            return rejected("Goal Understanding 表示需要先向用户澄清关键信息")
+        if goal.primary_intent != "product_recommendation":
+            return rejected("当前 primary_intent 不是商品推荐")
+        snapshot = context.recommendation_context
+        if snapshot is None:
+            return rejected("请先调用 collect_recommendation_context")
+        spec = context.recommendation_spec
+        if spec is None:
+            return rejected("请先调用 generate_recommendation_spec")
+        if not context.organic_search_attempted:
+            return rejected("请先调用 search_organic_candidates")
+        if not context.ad_search_attempted:
+            return rejected("请先调用 search_ad_candidates")
+
+        demand = recommendation_demand_from_goal(goal, spec)
+        organic_products = list(context.organic_search_products)
+        ad_candidates = list(context.ad_search_candidates)
+        source_statuses = dict(snapshot.source_statuses)
+        source_statuses.update(context.organic_search_statuses)
+        source_statuses["advertisement"] = context.ad_search_status
 
         context.remember_products(organic_products)
         context.remember_candidates(ad_candidates)
@@ -748,12 +1040,12 @@ def create_tools(
             demand=demand,
             organic_products=organic_products,
             ad_candidates=ad_candidates[:10],
-            catalog=catalog,
-            browse_events=browse_events,
-            orders=orders,
-            cart=cart,
-            agent_profile=agent_profile,
-            platform_profile=platform_profile,
+            catalog=snapshot.catalog,
+            browse_events=snapshot.browse_history,
+            orders=snapshot.orders,
+            cart=snapshot.cart,
+            agent_profile=snapshot.agent_profile,
+            platform_profile=snapshot.platform_profile,
             source_statuses=source_statuses,
         )
         context.recommendation_batch = batch
@@ -900,6 +1192,11 @@ def create_tools(
         )
 
     return [
+        understand_goal_tool,
+        collect_recommendation_context_tool,
+        generate_recommendation_spec_tool,
+        search_organic_candidates_tool,
+        search_ad_candidates_tool,
         recommend_products_tool,
         rerank_recommendations_tool,
         update_plan_tool,
@@ -934,6 +1231,7 @@ async def stream_agent_reply(
     previous_plan_state: PlanState | None = None,
     previous_recommendations: Sequence[Product] = (),
     previous_orders: Sequence[OrderLink] = (),
+    previous_goal_understanding: GoalUnderstandingResult | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     message_id = f"assistant-{uuid4().hex}"
     yield {"type": "start", "message_id": message_id}
@@ -944,6 +1242,10 @@ async def stream_agent_reply(
         turn_id=message_id,
         plan_state=previous_plan_state,
         current_user_request=messages[-1].content if messages else "",
+        conversation_messages=tuple(messages),
+        previous_recommendations=tuple(previous_recommendations),
+        previous_orders=tuple(previous_orders),
+        previous_goal_understanding=previous_goal_understanding,
     )
     context.remember_products(previous_recommendations)
     content_parts: list[str] = []
@@ -955,6 +1257,7 @@ async def stream_agent_reply(
             previous_plan_state,
             previous_recommendations,
             previous_orders,
+            previous_goal_understanding,
         )
         if model_override is None:
             client = AsyncOpenAI(
@@ -974,6 +1277,14 @@ async def stream_agent_reply(
             config=config,
             model=model,
         )
+        recommendation_spec_generator = AgentRecommendationSpecGenerator(
+            config=config,
+            model=model,
+        )
+        goal_understander = AgentGoalUnderstander(
+            config=config,
+            model=model,
+        )
         agent = Agent[ShoppingAgentContext](
             name="小牛导购",
             instructions=instructions,
@@ -981,6 +1292,8 @@ async def stream_agent_reply(
             tools=create_tools(
                 context,
                 config,
+                goal_understander=goal_understander,
+                recommendation_spec_generator=recommendation_spec_generator,
                 semantic_reranker=semantic_reranker,
             ),
             model_settings=ModelSettings(
@@ -1121,6 +1434,16 @@ async def stream_agent_reply(
                 product.model_dump(mode="json")
                 for product in context.selected_products.values()
             ],
+            "goal_understanding": (
+                context.goal_understanding.model_dump(mode="json")
+                if context.goal_understanding is not None
+                else None
+            ),
+            "recommendation_spec": (
+                context.recommendation_spec.model_dump(mode="json")
+                if context.recommendation_spec is not None
+                else None
+            ),
         }
     except PromptLoadError as exc:
         yield {
@@ -1141,6 +1464,16 @@ async def stream_agent_reply(
                 product.model_dump(mode="json")
                 for product in context.selected_products.values()
             ],
+            "goal_understanding": (
+                context.goal_understanding.model_dump(mode="json")
+                if context.goal_understanding is not None
+                else None
+            ),
+            "recommendation_spec": (
+                context.recommendation_spec.model_dump(mode="json")
+                if context.recommendation_spec is not None
+                else None
+            ),
         }
     except MaxTurnsExceeded:
         yield {
@@ -1167,6 +1500,16 @@ async def stream_agent_reply(
                 product.model_dump(mode="json")
                 for product in context.selected_products.values()
             ],
+            "goal_understanding": (
+                context.goal_understanding.model_dump(mode="json")
+                if context.goal_understanding is not None
+                else None
+            ),
+            "recommendation_spec": (
+                context.recommendation_spec.model_dump(mode="json")
+                if context.recommendation_spec is not None
+                else None
+            ),
         }
     except Exception:
         logger.exception("Agents SDK run failed")
@@ -1193,6 +1536,16 @@ async def stream_agent_reply(
                 product.model_dump(mode="json")
                 for product in context.selected_products.values()
             ],
+            "goal_understanding": (
+                context.goal_understanding.model_dump(mode="json")
+                if context.goal_understanding is not None
+                else None
+            ),
+            "recommendation_spec": (
+                context.recommendation_spec.model_dump(mode="json")
+                if context.recommendation_spec is not None
+                else None
+            ),
         }
     finally:
         if client is not None:
