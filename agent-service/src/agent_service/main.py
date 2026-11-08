@@ -9,7 +9,7 @@ def run() -> None:
     parser = argparse.ArgumentParser(description="Start the shopping agent service")
     parser.add_argument(
         "--config",
-        help="Path to the LLM YAML config file",
+        help="Path to the service YAML config file",
     )
     parser.add_argument(
         "--reload",

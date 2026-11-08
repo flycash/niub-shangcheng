@@ -17,6 +17,8 @@ from .models import (
     StoredMessage,
     ToolTrace,
 )
+from .observability.database import ObservedConnection, database_span
+from .observability.spans import repository_operation
 
 FIXED_USER_ID = 1
 
@@ -31,12 +33,18 @@ class ConversationStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+    def connect(self) -> ObservedConnection:
+        with database_span("CONNECT"):
+            connection = sqlite3.connect(self.database_path, timeout=5)
+            connection.row_factory = sqlite3.Row
+        with database_span(
+            "PRAGMA",
+            statement="PRAGMA foreign_keys = ON",
+        ):
+            connection.execute("PRAGMA foreign_keys = ON")
+        return ObservedConnection(connection)
 
+    @repository_operation("conversation.initialize")
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(
@@ -85,6 +93,7 @@ class ConversationStore:
                     "ALTER TABLE messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
                 )
 
+    @repository_operation("conversation.create")
     def create_conversation(self, user_id: int, first_message: str) -> str:
         conversation_id = f"conversation-{uuid4().hex}"
         title = " ".join(first_message.split())[:40] or "新对话"
@@ -99,6 +108,7 @@ class ConversationStore:
             )
         return conversation_id
 
+    @repository_operation("conversation.exists")
     def conversation_exists(self, user_id: int, conversation_id: str) -> bool:
         with self.connect() as connection:
             row = connection.execute(
@@ -110,6 +120,7 @@ class ConversationStore:
             ).fetchone()
         return row is not None
 
+    @repository_operation("message.create")
     def add_message(
         self,
         conversation_id: str,
@@ -155,6 +166,7 @@ class ConversationStore:
             )
         return message_id
 
+    @repository_operation("message.finish")
     def finish_message(
         self,
         message_id: str,
@@ -187,6 +199,7 @@ class ConversationStore:
                     (now, row["conversation_id"]),
                 )
 
+    @repository_operation("conversation.list")
     def list_conversations(self, user_id: int) -> list[ConversationSummary]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -216,6 +229,7 @@ class ConversationStore:
             for row in rows
         ]
 
+    @repository_operation("conversation.get")
     def get_conversation(
         self,
         user_id: int,
@@ -252,6 +266,7 @@ class ConversationStore:
             messages=[self._stored_message(message) for message in messages],
         )
 
+    @repository_operation("conversation.model_context")
     def model_context(self, conversation_id: str) -> list[StoredMessage]:
         with self.connect() as connection:
             rows = connection.execute(

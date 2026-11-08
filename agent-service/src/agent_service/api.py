@@ -25,6 +25,8 @@ from .models import (
     StoredMessage,
     ToolTrace,
 )
+from .observability.spans import ChatObservation
+from .observability.telemetry import configure_observability
 from .storage import FIXED_USER_ID, ConversationStore, get_conversation_store
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,7 @@ async def persisted_agent_stream(
     config: LLMConfig,
     store: ConversationStore,
     mall: MallGateway,
+    chat: ChatObservation,
 ) -> AsyncIterator[str]:
     content_parts: list[str] = []
     recommendations: dict[str, Product] = {}
@@ -94,6 +97,12 @@ async def persisted_agent_stream(
     recommendation_spec: RecommendationSpec | None = None
     created_orders: dict[str, OrderLink] = {}
     persisted = False
+    chat_outcome = "failed"
+    chat_error: BaseException | None = None
+    chat.set_conversation(
+        conversation_id=conversation_id,
+        turn_id=assistant_message_id,
+    )
 
     def message_metadata() -> dict[str, object]:
         metadata: dict[str, object] = {
@@ -122,6 +131,7 @@ async def persisted_agent_stream(
             ]
         return metadata
 
+    chat_token = chat.attach()
     yield sse_event(
         {
             "type": "conversation",
@@ -237,6 +247,7 @@ async def persisted_agent_stream(
                     metadata=message_metadata(),
                 )
                 persisted = True
+                chat_outcome = "failed"
                 yield raw_event
                 return
 
@@ -277,6 +288,7 @@ async def persisted_agent_stream(
                     metadata=message_metadata(),
                 )
                 persisted = True
+                chat_outcome = "completed"
                 yield raw_event
                 return
 
@@ -288,6 +300,7 @@ async def persisted_agent_stream(
             metadata=message_metadata(),
         )
         persisted = True
+        chat_outcome = "failed"
         yield sse_event(
             {
                 "type": "error",
@@ -296,8 +309,10 @@ async def persisted_agent_stream(
             }
         )
     except asyncio.CancelledError:
+        chat_outcome = "client_disconnected"
         raise
-    except Exception:
+    except Exception as exc:
+        chat_error = exc
         logger.exception("Persisted LLM stream failed")
         error_message = "对话流处理失败，请查看 agent-service 终端日志。"
         store.finish_message(
@@ -307,6 +322,7 @@ async def persisted_agent_stream(
             metadata=message_metadata(),
         )
         persisted = True
+        chat_outcome = "failed"
         yield sse_event(
             {
                 "type": "error",
@@ -322,6 +338,9 @@ async def persisted_agent_stream(
                 "failed",
                 metadata=message_metadata(),
             )
+            chat_outcome = "client_disconnected"
+        chat.detach(chat_token)
+        chat.end(chat_outcome, error=chat_error)
 
 
 async def configuration_error_stream(
@@ -329,24 +348,34 @@ async def configuration_error_stream(
     conversation_title: str,
     assistant_message_id: str,
     message: str,
+    chat: ChatObservation,
 ) -> AsyncIterator[str]:
-    yield sse_event(
-        {
-            "type": "conversation",
-            "conversation_id": conversation_id,
-            "title": conversation_title,
-        }
+    chat.set_conversation(
+        conversation_id=conversation_id,
+        turn_id=assistant_message_id,
     )
-    yield sse_event(
-        {"type": "start", "message_id": assistant_message_id}
-    )
-    yield sse_event(
-        {
-            "type": "error",
-            "message_id": assistant_message_id,
-            "message": message,
-        }
-    )
+    chat_token = chat.attach()
+    try:
+        yield sse_event(
+            {
+                "type": "conversation",
+                "conversation_id": conversation_id,
+                "title": conversation_title,
+            }
+        )
+        yield sse_event(
+            {"type": "start", "message_id": assistant_message_id}
+        )
+        yield sse_event(
+            {
+                "type": "error",
+                "message_id": assistant_message_id,
+                "message": message,
+            }
+        )
+    finally:
+        chat.detach(chat_token)
+        chat.end("failed")
 
 
 @app.get("/health")
@@ -398,38 +427,54 @@ async def stream_chat(
     store: ConversationStore = Depends(get_conversation_store),
     mall: MallGateway = Depends(get_mall_client),
 ) -> StreamingResponse:
-    if request.conversation_id:
-        conversation = store.get_conversation(
-            FIXED_USER_ID,
-            request.conversation_id,
-        )
-        if conversation is None:
-            raise HTTPException(status_code=404, detail="对话不存在")
-        conversation_id = conversation.id
-        title = conversation.title
-    else:
-        conversation_id = store.create_conversation(
-            FIXED_USER_ID,
-            request.message,
-        )
-        conversation = store.get_conversation(FIXED_USER_ID, conversation_id)
-        if conversation is None:
-            raise HTTPException(status_code=500, detail="创建对话失败")
-        title = conversation.title
+    chat = ChatObservation()
+    try:
+        with chat.active():
+            if request.conversation_id:
+                conversation = store.get_conversation(
+                    FIXED_USER_ID,
+                    request.conversation_id,
+                )
+                if conversation is None:
+                    raise HTTPException(status_code=404, detail="对话不存在")
+                conversation_id = conversation.id
+                title = conversation.title
+            else:
+                conversation_id = store.create_conversation(
+                    FIXED_USER_ID,
+                    request.message,
+                )
+                conversation = store.get_conversation(
+                    FIXED_USER_ID,
+                    conversation_id,
+                )
+                if conversation is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="创建对话失败",
+                    )
+                title = conversation.title
 
-    store.add_message(
-        conversation_id,
-        "user",
-        request.message,
-        "completed",
-    )
-    context = store.model_context(conversation_id)
-    assistant_message_id = store.add_message(
-        conversation_id,
-        "assistant",
-        "",
-        "streaming",
-    )
+            store.add_message(
+                conversation_id,
+                "user",
+                request.message,
+                "completed",
+            )
+            context = store.model_context(conversation_id)
+            assistant_message_id = store.add_message(
+                conversation_id,
+                "assistant",
+                "",
+                "streaming",
+            )
+            chat.set_conversation(
+                conversation_id=conversation_id,
+                turn_id=assistant_message_id,
+            )
+    except BaseException as exc:
+        chat.end("failed", error=exc)
+        raise
 
     try:
         config = load_llm_config()
@@ -441,6 +486,7 @@ async def stream_chat(
             title,
             assistant_message_id,
             message,
+            chat,
         )
     else:
         stream = persisted_agent_stream(
@@ -451,6 +497,7 @@ async def stream_chat(
             config,
             store,
             mall,
+            chat,
         )
 
     return StreamingResponse(
@@ -462,3 +509,6 @@ async def stream_chat(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+configure_observability(app)

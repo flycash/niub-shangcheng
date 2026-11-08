@@ -11,3 +11,73 @@ llm:
   # 推荐主流程和可能的独立语义终排至少需要 10 个模型/工具回合。
   max_turns: 10
   tool_timeout_seconds: 1800
+
+observability:
+  enabled: true
+
+  service:
+    name: "agent-service"
+    environment: "local"
+    version: "0.1.0"
+
+  logs:
+    enabled: true
+    level: "INFO"
+    format: "json"
+    access_log: true
+
+    # 工具调用明细单独使用 DEBUG，避免把整个服务日志级别切到 DEBUG。
+    tool_level: "DEBUG"
+    tool:
+      include_arguments: true
+      include_result: true
+      max_payload_chars: 16000
+      redact_keys:
+        - "authorization"
+        - "api_key"
+        - "token"
+        - "password"
+
+  metrics:
+    enabled: true
+
+    prometheus:
+      enabled: true
+      path: "/metrics"
+
+    log:
+      enabled: false
+      level: "DEBUG"
+      export_interval_millis: 30000
+      include_histogram_buckets: true
+      max_data_points_per_batch: 1000
+
+  traces:
+    enabled: true
+    sample_ratio: 1.0
+    excluded_paths:
+      - "/health"
+      - "/metrics"
+    propagators:
+      - "tracecontext"
+      - "baggage"
+      - "b3multi"
+
+    zipkin:
+      enabled: true
+      endpoint: "http://127.0.0.1:9411/api/v2/spans"
+      timeout_millis: 3000
+
+    log:
+      enabled: true
+      # Zipkin 成功时不重复输出；未启用或导出失败时把 trace 输出到日志。
+      fallback_only: true
+      level: "DEBUG"
+      include_events: true
+      max_attribute_length: 4000
+      max_spans_per_batch: 512
+
+    batch:
+      max_queue_size: 2048
+      schedule_delay_millis: 2000
+      max_export_batch_size: 512

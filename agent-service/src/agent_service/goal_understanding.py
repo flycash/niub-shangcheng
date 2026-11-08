@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
-from agents import Agent, ModelSettings, RunConfig, Runner
+from agents import Agent, ModelSettings
 from pydantic import ValidationError
 
 from .llm_config import LLMConfig
@@ -16,6 +16,7 @@ from .models import (
     Product,
 )
 from .prompt_loader import PromptLoadError, load_prompt
+from .observability.agents import run_observed_action
 
 
 GOAL_UNDERSTANDING_PROMPT_PATH = (
@@ -129,15 +130,16 @@ class AgentGoalUnderstander:
             ],
         }
         try:
-            result = await Runner.run(
+            result = await run_observed_action(
                 agent,
+                action_name="goal_understanding",
+                model=str(self.config.model),
                 input=json.dumps(
                     payload,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
                 max_turns=1,
-                run_config=RunConfig(tracing_disabled=True),
             )
         except Exception as exc:
             raise GoalUnderstandingError(

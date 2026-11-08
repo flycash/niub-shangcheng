@@ -15,6 +15,7 @@ from .models import (
     RecommendationSpec,
     ShoppingCart,
 )
+from .observability.http import observed_async_transport
 
 
 class CatalogUnavailable(Exception):
@@ -76,9 +77,12 @@ class MallClient:
         json: dict[str, Any] | None = None,
     ) -> Any:
         try:
+            transport = self.transport
+            if transport is None:
+                transport = httpx.AsyncHTTPTransport()
             async with httpx.AsyncClient(
                 timeout=self.timeout,
-                transport=self.transport,
+                transport=observed_async_transport(transport),
             ) as client:
                 response = await client.request(
                     method,

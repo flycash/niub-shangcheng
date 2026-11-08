@@ -58,6 +58,13 @@ from .models import (
     SourceStatus,
     ToolTrace,
 )
+from .observability.agents import (
+    AgentTraceSession,
+    ObservabilityRunHooks,
+    instrument_tools,
+)
+from .observability.serialization import redact_payload
+from .observability.telemetry import get_observability_runtime
 from .prompt_loader import PromptLoadError, load_prompt
 from .recommendation_reranker import (
     AgentSemanticReranker,
@@ -74,6 +81,9 @@ from .recommendation_spec import (
 )
 
 logger = logging.getLogger(__name__)
+recommendation_spec_logger = logging.getLogger(
+    "agent_service.observability.tool"
+)
 set_tracing_disabled(True)
 
 DEMO_USER_ID = 1
@@ -900,6 +910,25 @@ def create_tools(
             logger.warning("recommendation SPEC generation failed: %s", exc)
             return unavailable_payload("Recommendation SPEC")
         context.recommendation_spec = spec
+        tool_log_config = (
+            get_observability_runtime().config.logs.tool
+        )
+        spec_payload = redact_payload(
+            spec.model_dump(mode="json"),
+            redact_keys=tool_log_config.redact_keys,
+            max_length=tool_log_config.max_payload_chars,
+        )
+        recommendation_spec_logger.debug(
+            "Recommendation SPEC generated",
+            extra={
+                "event": "agent.recommendation_spec.generated",
+                "agent.recommendation_spec": spec_payload,
+                "agent.recommendation_spec.search_query_count": len(
+                    spec.search_queries
+                ),
+                "agent.recommendation_spec.confidence": spec.confidence,
+            },
+        )
         return json.dumps(
             {
                 "status": "generated",
@@ -1191,7 +1220,7 @@ def create_tools(
             ensure_ascii=False,
         )
 
-    return [
+    tools = [
         understand_goal_tool,
         collect_recommendation_context_tool,
         generate_recommendation_spec_tool,
@@ -1212,6 +1241,10 @@ def create_tools(
         create_order_tool,
         get_order_tool,
     ]
+    return instrument_tools(
+        tools,
+        get_observability_runtime().config.logs.tool,
+    )
 
 
 def raw_item_value(item: Any, name: str) -> str | None:
@@ -1234,6 +1267,14 @@ async def stream_agent_reply(
     previous_goal_understanding: GoalUnderstandingResult | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     message_id = f"assistant-{uuid4().hex}"
+    trace_session = AgentTraceSession(
+        model=str(
+            getattr(model_override, "model", config.model)
+            if model_override is not None
+            else config.model
+        )
+    )
+    trace_outcome = "failed"
     yield {"type": "start", "message_id": message_id}
 
     client: AsyncOpenAI | None = None
@@ -1302,93 +1343,108 @@ async def stream_agent_reply(
             ),
         )
 
-        result = Runner.run_streamed(
-            agent,
-            input=[
-                {"role": message.role, "content": message.content}
-                for message in messages
-            ],
-            context=context,
-            max_turns=config.max_turns,
-            run_config=RunConfig(tracing_disabled=True),
-        )
+        with trace_session.bind():
+            result = Runner.run_streamed(
+                agent,
+                input=[
+                    {"role": message.role, "content": message.content}
+                    for message in messages
+                ],
+                context=context,
+                hooks=ObservabilityRunHooks(trace_session),
+                max_turns=config.max_turns,
+                run_config=RunConfig(tracing_disabled=True),
+            )
+            async for event in result.stream_events():
+                if isinstance(event, RawResponsesStreamEvent):
+                    trace_session.observe_model_event(event.data)
+                    if isinstance(event.data, ResponseTextDeltaEvent):
+                        content_parts.append(event.data.delta)
+                        yield {
+                            "type": "delta",
+                            "message_id": message_id,
+                            "content": event.data.delta,
+                        }
+                    continue
 
-        async for event in result.stream_events():
-            if isinstance(event, RawResponsesStreamEvent):
-                if isinstance(event.data, ResponseTextDeltaEvent):
-                    content_parts.append(event.data.delta)
-                    yield {
-                        "type": "delta",
-                        "message_id": message_id,
-                        "content": event.data.delta,
-                    }
-                continue
+                if not isinstance(event, RunItemStreamEvent):
+                    continue
 
-            if not isinstance(event, RunItemStreamEvent):
-                continue
-
-            if event.name == "tool_called":
-                tool_name = event.item.tool_name or "unknown_tool"
-                call_id = event.item.call_id
-                arguments = raw_item_value(event.item, "arguments") or ""
-                trace_index = len(context.tool_trace)
-                context.tool_trace.append(
-                    ToolTrace(
-                        call_id=call_id,
-                        tool=tool_name,
-                        arguments=arguments,
-                        status="started",
+                if event.name == "tool_called":
+                    tool_name = event.item.tool_name or "unknown_tool"
+                    call_id = event.item.call_id
+                    arguments = raw_item_value(event.item, "arguments") or ""
+                    trace_index = len(context.tool_trace)
+                    context.tool_trace.append(
+                        ToolTrace(
+                            call_id=call_id,
+                            tool=tool_name,
+                            arguments=arguments,
+                            status="started",
+                        )
                     )
-                )
-                if call_id:
-                    running_tools[call_id] = trace_index
-                yield {
-                    "type": "tool_started",
-                    "message_id": message_id,
-                    "call_id": call_id,
-                    "tool": tool_name,
-                    "arguments": arguments,
-                }
+                    if call_id:
+                        running_tools[call_id] = trace_index
+                    yield {
+                        "type": "tool_started",
+                        "message_id": message_id,
+                        "call_id": call_id,
+                        "tool": tool_name,
+                        "arguments": arguments,
+                    }
 
-            elif event.name == "tool_output":
-                tool_name = "tool"
-                call_id = event.item.call_id
-                trace_index = running_tools.get(call_id or "")
-                if trace_index is not None:
-                    trace = context.tool_trace[trace_index]
-                    tool_name = trace.tool
-                    trace.status = "completed"
-                    trace.summary = str(event.item.output)[:500]
-                yield {
-                    "type": "tool_completed",
-                    "message_id": message_id,
-                    "call_id": call_id,
-                    "tool": tool_name,
-                }
-                if tool_name == "update_plan" and context.plan_state is not None:
+                elif event.name == "tool_output":
+                    tool_name = "tool"
+                    call_id = event.item.call_id
+                    trace_index = running_tools.get(call_id or "")
+                    if trace_index is not None:
+                        trace = context.tool_trace[trace_index]
+                        tool_name = trace.tool
+                        trace.status = "completed"
+                        trace.summary = str(event.item.output)[:500]
                     yield {
-                        "type": "plan_updated",
+                        "type": "tool_completed",
                         "message_id": message_id,
-                        "plan_state": context.plan_state.model_dump(mode="json"),
+                        "call_id": call_id,
+                        "tool": tool_name,
                     }
-                if tool_name == "create_order" and context.created_orders:
-                    yield {
-                        "type": "order_created",
-                        "message_id": message_id,
-                        "order": list(context.created_orders.values())[-1].model_dump(
-                            mode="json"
-                        ),
-                    }
-                if context.selected_products and not recommendations_emitted:
-                    recommendations_emitted = True
-                    yield {
-                        "type": "recommendations",
-                        "message_id": message_id,
-                        "products": [
-                            product.model_dump(mode="json")
-                            for product in context.selected_products.values()
-                        ],
-                    }
+                    if (
+                        tool_name == "update_plan"
+                        and context.plan_state is not None
+                    ):
+                        yield {
+                            "type": "plan_updated",
+                            "message_id": message_id,
+                            "plan_state": context.plan_state.model_dump(
+                                mode="json"
+                            ),
+                        }
+                    if (
+                        tool_name == "create_order"
+                        and context.created_orders
+                    ):
+                        yield {
+                            "type": "order_created",
+                            "message_id": message_id,
+                            "order": list(
+                                context.created_orders.values()
+                            )[-1].model_dump(mode="json"),
+                        }
+                    if (
+                        context.selected_products
+                        and not recommendations_emitted
+                    ):
+                        recommendations_emitted = True
+                        yield {
+                            "type": "recommendations",
+                            "message_id": message_id,
+                            "products": [
+                                product.model_dump(mode="json")
+                                for product in (
+                                    context.selected_products.values()
+                                )
+                            ],
+                        }
         if not content_parts and isinstance(result.final_output, str):
             content_parts.append(result.final_output)
             yield {
@@ -1415,6 +1471,7 @@ async def stream_agent_reply(
                 ],
             }
 
+        trace_outcome = "completed"
         yield {
             "type": "done",
             "message_id": message_id,
@@ -1446,6 +1503,7 @@ async def stream_agent_reply(
             ),
         }
     except PromptLoadError as exc:
+        trace_session.finish("failed", exc)
         yield {
             "type": "error",
             "message_id": message_id,
@@ -1476,6 +1534,7 @@ async def stream_agent_reply(
             ),
         }
     except MaxTurnsExceeded:
+        trace_session.finish("failed")
         yield {
             "type": "error",
             "message_id": message_id,
@@ -1511,7 +1570,11 @@ async def stream_agent_reply(
                 else None
             ),
         }
-    except Exception:
+    except (asyncio.CancelledError, GeneratorExit):
+        trace_outcome = "cancelled"
+        raise
+    except Exception as exc:
+        trace_session.finish("failed", exc)
         logger.exception("Agents SDK run failed")
         yield {
             "type": "error",
@@ -1548,5 +1611,6 @@ async def stream_agent_reply(
             ),
         }
     finally:
+        trace_session.finish(trace_outcome)
         if client is not None:
             await client.close()

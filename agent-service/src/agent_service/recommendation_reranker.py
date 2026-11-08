@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
-from agents import Agent, ModelSettings, RunConfig, Runner
+from agents import Agent, ModelSettings
 from pydantic import ValidationError
 
 from .llm_config import LLMConfig
@@ -13,6 +13,7 @@ from .models import (
     SemanticRankingResult,
 )
 from .prompt_loader import PromptLoadError, load_prompt
+from .observability.agents import run_observed_action
 
 
 RERANKER_PROMPT_PATH = (
@@ -154,15 +155,16 @@ class AgentSemanticReranker:
             "candidates": self._candidates(batch),
         }
         try:
-            result = await Runner.run(
+            result = await run_observed_action(
                 agent,
+                action_name="semantic_rerank",
+                model=str(self.config.model),
                 input=json.dumps(
                     payload,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
                 max_turns=1,
-                run_config=RunConfig(tracing_disabled=True),
             )
         except Exception as exc:
             raise SemanticRerankError(

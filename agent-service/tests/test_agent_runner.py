@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 import httpx
 from agents.testing import ScriptedModel, assistant_message, function_call
@@ -574,7 +575,9 @@ def test_goal_understanding_agent_uses_its_own_prompt() -> None:
     )
 
 
-def test_collect_context_and_generate_recommendation_spec_are_separate_actions() -> None:
+def test_collect_context_and_generate_recommendation_spec_are_separate_actions(
+    caplog,
+) -> None:
     context = ShoppingAgentContext(mall=mall_client())
     context.goal_understanding = goal_understanding()
     context.recommendation_spec_generator = StaticRecommendationSpecGenerator(
@@ -584,15 +587,32 @@ def test_collect_context_and_generate_recommendation_spec_are_separate_actions()
     collected = json.loads(
         invoke_tool(context, "collect_recommendation_context", {})
     )
-    generated = json.loads(
-        invoke_tool(context, "generate_recommendation_spec", {})
-    )
+    with caplog.at_level(
+        logging.DEBUG,
+        logger="agent_service.observability.tool",
+    ):
+        generated = json.loads(
+            invoke_tool(context, "generate_recommendation_spec", {})
+        )
 
     assert collected["status"] == "collected"
     assert collected["browse_count"] > 0
     assert generated["status"] == "generated"
     assert context.recommendation_spec is not None
     assert context.recommendation_spec.search_queries == ["通勤", "办公室"]
+    spec_log = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", "")
+        == "agent.recommendation_spec.generated"
+    )
+    assert getattr(spec_log, "agent.recommendation_spec")[
+        "search_queries"
+    ] == ["通勤", "办公室"]
+    assert (
+        getattr(spec_log, "agent.recommendation_spec.search_query_count")
+        == 2
+    )
 
 
 def test_organic_and_ad_search_actions_cache_candidates_independently() -> None:
@@ -1239,3 +1259,70 @@ def test_purchase_turn_uses_previous_recommendation_and_emits_order() -> None:
     instructions = model.first_call.system_instructions or ""
     assert "日常帆布托特包" in instructions
     assert '"position": 1' in instructions
+
+
+def test_observability_emits_react_llm_and_tool_spans(
+    caplog,
+    otel_test_exporter,
+) -> None:
+    otel_test_exporter.clear()
+    model = ScriptedModel(
+        [
+            [
+                function_call(
+                    "get_agent_profile",
+                    {},
+                    call_id="call-profile",
+                )
+            ],
+            [assistant_message("已经读取画像。")],
+        ]
+    )
+
+    async def collect_events() -> list[dict[str, object]]:
+        return [
+            event
+            async for event in stream_agent_reply(
+                [ConversationMessage(role="user", content="推荐通勤商品")],
+                llm_config(),
+                mall_client(),
+                model_override=model,
+            )
+        ]
+
+    with caplog.at_level(
+        logging.DEBUG,
+        logger="agent_service.observability.tool",
+    ):
+        events = asyncio.run(collect_events())
+    assert events[-1]["type"] == "done"
+
+    spans = otel_test_exporter.get_finished_spans()
+    span_names = [span.name for span in spans]
+    assert span_names.count("agent.react") >= 2
+    assert span_names.count("agent.llm") >= 2
+    assert span_names.count("agent.tool") == 1
+
+    llm_spans = [span for span in spans if span.name == "agent.llm"]
+    assert all(
+        "agent.llm.duration_ms" in span.attributes
+        for span in llm_spans
+    )
+    assert any(
+        "agent.llm.first_char_ms" in span.attributes
+        for span in llm_spans
+    )
+
+    tool_logs = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", "").startswith("agent.tool.")
+    ]
+    assert any(
+        getattr(record, "event", "") == "agent.tool.started"
+        for record in tool_logs
+    )
+    assert any(
+        getattr(record, "event", "") == "agent.tool.completed"
+        for record in tool_logs
+    )

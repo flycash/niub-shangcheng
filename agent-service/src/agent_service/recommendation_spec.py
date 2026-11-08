@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
-from agents import Agent, ModelSettings, RunConfig, Runner
+from agents import Agent, ModelSettings
 from pydantic import ValidationError
 
 from .llm_config import LLMConfig
@@ -19,6 +19,7 @@ from .models import (
     ShoppingCart,
 )
 from .prompt_loader import PromptLoadError, load_prompt
+from .observability.agents import run_observed_action
 
 
 RECOMMENDATION_SPEC_PROMPT_PATH = (
@@ -214,15 +215,16 @@ class AgentRecommendationSpecGenerator:
             ],
         }
         try:
-            result = await Runner.run(
+            result = await run_observed_action(
                 agent,
+                action_name="recommendation_spec",
+                model=str(self.config.model),
                 input=json.dumps(
                     payload,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
                 max_turns=1,
-                run_config=RunConfig(tracing_disabled=True),
             )
         except Exception as exc:
             raise RecommendationSpecError(
