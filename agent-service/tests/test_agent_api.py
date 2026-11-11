@@ -114,6 +114,23 @@ GOAL_UNDERSTANDING = {
     "requires_clarification": False,
     "clarification_question": None,
     "pending_intent_question": "是否继续处理订单查询？",
+    "recommendation_requirements": {
+        "status": "ready",
+        "slots": {
+            "query": "通勤",
+            "category": None,
+            "min_price_cents": None,
+            "max_price_cents": 30000,
+            "required_tags": [],
+            "excluded_tags": [],
+            "scenario": "self",
+            "usage": "通勤",
+            "recipient": None,
+        },
+        "next_question": None,
+        "declined_requirements": [],
+        "collection_reason": "已有明确商品目标和预算，可以直接推荐",
+    },
 }
 
 RECOMMENDATION_SPEC = {
@@ -275,6 +292,11 @@ def test_stream_chat_persists_completed_conversation(
     assert detail.messages[1].goal_understanding.pending_intents == [
         "order_query"
     ]
+    assert (
+        detail.messages[1]
+        .goal_understanding.recommendation_requirements.status
+        == "ready"
+    )
     assert detail.messages[1].recommendation_spec is not None
     assert detail.messages[1].recommendation_spec.search_queries == [
         "通勤",
@@ -442,6 +464,11 @@ def test_stream_chat_passes_previous_plan_state_to_next_turn(
     assert captured["previous_goal_understanding"].pending_intents == [
         "order_query"
     ]
+    assert (
+        captured["previous_goal_understanding"]
+        .recommendation_requirements.slots.max_price_cents
+        == 30000
+    )
 
 
 def test_conversation_history_endpoints(store: ConversationStore) -> None:

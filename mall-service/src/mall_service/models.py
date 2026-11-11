@@ -180,6 +180,7 @@ class RecommendationSearchSpec(BaseModel):
     weak_categories: list[str] = Field(default_factory=list)
     negative_tags: list[str] = Field(default_factory=list)
     search_queries: list[str] = Field(min_length=1, max_length=6)
+    recall_mode: Literal["targeted", "broad"] = "targeted"
     scenario: Literal[
         "general",
         "self",

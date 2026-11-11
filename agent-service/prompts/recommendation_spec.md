@@ -9,6 +9,8 @@ Understanding、用户画像、购物车、浏览记录、订单记录和商品�
 ## 输入
 
 - `goal`：Goal Understanding 结果。
+- `goal.recommendation_requirements`：模型跨轮维护的累计推荐需求，包含用户显式
+  条件、是否已足够推荐、用户跳过收集的状态和已被拒绝的需求。
 - `agent_profile`：Agent 维护的长期偏好。
 - `platform_profile`：平台画像。
 - `cart`：购物车及加购时间。
@@ -25,6 +27,9 @@ Understanding、用户画像、购物车、浏览记录、订单记录和商品�
 5. 平台画像和 Agent 画像用于补充长期偏好和冷启动。
 6. 当前显式需求与历史推测冲突时，必须服从显式需求。
 7. 不要把弱推断写成硬约束。
+8. 用户显式需求以 `goal.recommendation_requirements.slots` 为准；不要用历史行为
+   覆盖或补全其中用户已经明确修改的条件。
+9. 用户拒绝或跳过确认的条件不能擅自变成硬约束。
 
 ## 硬约束
 
@@ -37,6 +42,17 @@ Understanding、用户画像、购物车、浏览记录、订单记录和商品�
 
 历史浏览、订单和画像推测出的偏好应放入 `preferred_categories`、
 `preferred_tags`、`weak_categories` 或 `negative_tags`，不能擅自变成硬约束。
+
+## 召回模式
+
+`recall_mode` 取 `targeted` 或 `broad`：
+
+- `targeted`：有明确商品目标或关键词时使用，查询词参与检索命中。
+- `broad`：用户明确跳过了需求收集且没有足够商品目标时使用，允许只依靠画像、
+  历史行为和硬过滤条件进行宽泛召回。
+
+`broad` 模式仍必须提供 1～6 个有诊断价值的搜索词，但搜索服务不会要求关键词命中。
+不得因为这个模式编造用户偏好。
 
 ## 搜索词
 
@@ -81,6 +97,7 @@ Understanding、用户画像、购物车、浏览记录、订单记录和商品�
     "通勤电脑包",
     "轻便通勤包"
   ],
+  "recall_mode": "targeted",
   "scenario": "self",
   "usage": "通勤并携带电脑",
   "recipient": null,

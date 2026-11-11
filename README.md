@@ -161,7 +161,8 @@ pnpm --dir web build
 
 - `update_plan`：由模型创建或整体替换 Plan 和 Plan State。
 - `understand_goal`：独立 Goal Understanding Action，使用单独 Prompt 和模型
-  调用识别多意图、提取槽位，并确定本轮第一个待处理意图。
+  调用识别多意图、提取槽位，并维护跨轮累计推荐需求。模型自主决定继续询问、
+  直接推荐或跳过需求收集，每轮最多提出一个需求问题。
 - `collect_recommendation_context`：为 Recommendation SPEC 收集画像、购物车、
   浏览记录、订单和商品目录，不向主 Agent暴露原始行为数据。
 - `generate_recommendation_spec`：独立 SPEC Action，根据 Goal Understanding 和
@@ -188,6 +189,13 @@ pnpm --dir web build
 模型仍需自行决定如何使用它。Plan State 通过 SSE 的 `plan_updated` 事件实时更新，
 并随助手消息保存到 SQLite。
 
+推荐需求收集同样由 Goal Understanding 模型推进。模型输出
+`recommendation_requirements`，其中 `status` 为 `collecting`、`ready` 或
+`bypassed`。`collecting` 时模型生成当前唯一要问的 `next_question`，主 Agent
+原样输出并结束本轮；`ready` 时直接进入推荐；用户说“别管那么多，直接推荐”等表达
+时，模型输出 `bypassed`，本轮不得二次确认。代码不设定固定询问顺序，也不生成
+固定问题模板，只校验状态结构、保存累计结果并阻止收集轮提前调用推荐工具。
+
 多意图消息由 `understand_goal` 保留完整意图顺序，但每轮只处理第一个意图。如果
 还有待处理意图，主 Agent 在完成第一个目标后询问用户是否继续；用户确认后，下一轮
 继续处理第一个 `pending_intent`。Goal Understanding 结果会随助手消息保存，用于
@@ -205,6 +213,10 @@ pnpm --dir web build
 推荐召回前会先生成 Recommendation SPEC。搜索与广告搜索共同使用 SPEC 中的硬约束
 和查询变体；SPEC 中的行为推断只指导召回，候选评分仍由统一公式计算，避免同一信号
 重复计权。SPEC 结果会持久化用于诊断。
+
+用户整体跳过需求收集且没有明确商品目标时，SPEC 模型可以选择 `broad` 召回模式。
+该模式仍应用用户明确给出的价格、品类和排除条件，但不强制关键词命中，以便利用画像
+和历史行为完成宽泛推荐。
 
 两个搜索 Action 都把完整 SPEC 发送给 `mall-service`。`mall-service` 目前不连接
 真实 Elasticsearch，而是把 SPEC 转换为模拟 ES DSL，通过日志打印完整查询条件，

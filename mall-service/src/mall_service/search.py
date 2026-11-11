@@ -91,7 +91,7 @@ def build_es_query(
         "filter": filters,
         "must_not": must_not,
     }
-    if text_should:
+    if text_should and spec.recall_mode == "targeted":
         bool_query["must"] = [
             {
                 "bool": {
@@ -100,6 +100,8 @@ def build_es_query(
                 }
             }
         ]
+    elif text_should:
+        preference_should.extend(text_should)
     if preference_should:
         bool_query["should"] = preference_should
         bool_query["minimum_should_match"] = 0
@@ -203,7 +205,7 @@ def mock_search_products(
         for query in [*spec.search_queries, spec.usage, spec.recipient]
         if query
     ]
-    if text_queries:
+    if text_queries and spec.recall_mode == "targeted":
         candidates = [
             (product, score)
             for product, score in candidates

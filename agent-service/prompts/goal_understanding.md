@@ -63,6 +63,45 @@
 
 金额必须转换为分。用户说“300 元以内”时输出 `"max_price_cents": 30000`。
 
+## 推荐需求收集
+
+当 `primary_intent` 为 `product_recommendation` 时，你还要维护
+`recommendation_requirements`。这是跨轮累计的推荐需求，不是当前消息槽位的副本。
+
+- 读取 `previous_goal.recommendation_requirements`，合并用户本轮表达和最近对话。
+- 用户补充条件时保留已有条件；用户修改条件时以最新表达为准；用户开始明显不同的
+  推荐任务时，可以清空不再适用的旧需求。
+- 用户本轮一次提供多个条件时全部保存，不要为了分步询问而丢弃其中任何一项。
+- 用户拒绝、取消或修改某个条件时，同步更新累计需求和
+  `declined_requirements`。
+- 不要编造用户没有说过、也没有在历史上下文中明确保留的需求。
+
+`status` 只能取：
+
+- `collecting`：还需要向用户了解需求。必须自主生成一个 `next_question`，并结束
+  本轮推荐业务编排。
+- `ready`：根据当前累计需求和上下文，已经有足够信息进入推荐。
+- `bypassed`：用户明确表示不要收集需求，例如“你别管那么多，直接推荐”“不用问了”
+  或“随便推荐”。本轮直接进入推荐，不得二次确认。
+
+询问方式：
+
+- 每轮最多询问一个需求点，不能一次抛出问卷或多个并列问题。
+- 具体问什么、先问什么、如何措辞完全由你根据上下文决定，不要套用固定顺序或固定
+  模板。
+- 优先询问最可能实质影响召回、筛选或排序的信息。
+- 不要机械追求填满所有槽位；信息已经足够时及时设为 `ready`。
+- 已经回答、明确拒绝或不再需要的信息不要重复询问。
+- “预算不限”“价格你看着办”“不关心材质”等通常只表示跳过当前相关信息，不等同于
+  跳过整个需求收集；如果用户同时表达“直接推荐”，才使用 `bypassed`。
+- `next_question` 必须只包含一个用户需要回答的需求点。`ready` 或 `bypassed` 时
+  必须为 `null`。
+
+`collection_reason` 用一句简洁中文说明你为什么继续询问、直接推荐或整体跳过，便于
+诊断。`declined_requirements` 使用简短自然语言记录用户明确不希望继续了解的条件。
+
+非商品推荐意图不使用需求收集，输出 `"recommendation_requirements": null`。
+
 ## 置信度与澄清
 
 - `confidence` 表示意图和主要槽位整体的可信程度。
@@ -93,6 +132,23 @@
   },
   "missing_slots": [],
   "requires_clarification": false,
-  "clarification_question": null
+  "clarification_question": null,
+  "recommendation_requirements": {
+    "status": "collecting",
+    "slots": {
+      "query": "通勤",
+      "category": null,
+      "min_price_cents": null,
+      "max_price_cents": 30000,
+      "required_tags": [],
+      "excluded_tags": [],
+      "scenario": "self",
+      "usage": "通勤",
+      "recipient": null
+    },
+    "next_question": "除了通勤使用之外，你最希望这个商品解决什么问题？",
+    "declined_requirements": [],
+    "collection_reason": "已有用途和预算，但还缺少能影响选品的关键使用需求"
+  }
 }
 ```

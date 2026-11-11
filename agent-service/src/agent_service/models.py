@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Product(BaseModel):
@@ -162,6 +162,53 @@ class RecommendationDemand(BaseModel):
 IntentType = str
 
 
+RecommendationRequirementStatus = Literal[
+    "collecting",
+    "ready",
+    "bypassed",
+]
+
+
+class RecommendationRequirementSlots(BaseModel):
+    query: str | None = Field(default=None, max_length=500)
+    category: str | None = Field(default=None, max_length=100)
+    min_price_cents: int | None = Field(default=None, ge=0)
+    max_price_cents: int | None = Field(default=None, ge=0)
+    required_tags: list[str] = Field(default_factory=list)
+    excluded_tags: list[str] = Field(default_factory=list)
+    scenario: Literal[
+        "general",
+        "self",
+        "gift",
+        "replenishment",
+    ] | None = None
+    usage: str | None = Field(default=None, max_length=500)
+    recipient: str | None = Field(default=None, max_length=200)
+
+
+class RecommendationRequirementState(BaseModel):
+    status: RecommendationRequirementStatus
+    slots: RecommendationRequirementSlots = Field(
+        default_factory=RecommendationRequirementSlots
+    )
+    next_question: str | None = Field(default=None, max_length=2_000)
+    declined_requirements: list[str] = Field(default_factory=list)
+    collection_reason: str | None = Field(default=None, max_length=2_000)
+
+    @model_validator(mode="after")
+    def question_matches_status(self) -> "RecommendationRequirementState":
+        if self.status == "collecting":
+            if not self.next_question or not self.next_question.strip():
+                raise ValueError(
+                    "collecting recommendation requirements need a next question"
+                )
+        elif self.next_question is not None:
+            raise ValueError(
+                "ready or bypassed recommendation requirements cannot have a question"
+            )
+        return self
+
+
 class GoalUnderstandingDraft(BaseModel):
     intents: list[IntentType] = Field(min_length=1, max_length=5)
     goal: str = Field(min_length=1, max_length=2_000)
@@ -170,6 +217,7 @@ class GoalUnderstandingDraft(BaseModel):
     missing_slots: list[str] = Field(default_factory=list)
     requires_clarification: bool = False
     clarification_question: str | None = Field(default=None, max_length=1_000)
+    recommendation_requirements: RecommendationRequirementState | None = None
 
 
 class GoalUnderstandingResult(BaseModel):
@@ -183,6 +231,7 @@ class GoalUnderstandingResult(BaseModel):
     requires_clarification: bool = False
     clarification_question: str | None = Field(default=None, max_length=1_000)
     pending_intent_question: str | None = Field(default=None, max_length=1_000)
+    recommendation_requirements: RecommendationRequirementState | None = None
 
 
 class RecommendationSpecHardConstraints(BaseModel):
@@ -209,6 +258,7 @@ class RecommendationSpec(BaseModel):
     weak_categories: list[str] = Field(default_factory=list)
     negative_tags: list[str] = Field(default_factory=list)
     search_queries: list[str] = Field(min_length=1, max_length=6)
+    recall_mode: Literal["targeted", "broad"] = "targeted"
     scenario: Literal[
         "general",
         "self",

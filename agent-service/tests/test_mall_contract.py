@@ -83,3 +83,26 @@ def test_agent_passes_whole_spec_to_mock_es_search() -> None:
     assert all(product.price_cents <= 30000 for product in products)
     assert ads
     assert all(item.source == "advertisement" for item in ads)
+
+
+def test_agent_spec_supports_model_selected_broad_recall() -> None:
+    client = mall_client()
+    spec = RecommendationSpec(
+        goal_summary="用户跳过需求收集，按已有信息宽泛推荐",
+        hard_constraints=RecommendationSpecHardConstraints(
+            max_price_cents=10000,
+        ),
+        preferred_categories=["箱包"],
+        preferred_tags=["通勤"],
+        search_queries=["通勤"],
+        recall_mode="broad",
+        confidence=0.7,
+    )
+
+    products = asyncio.run(
+        client.search_organic_with_spec(spec, limit=10)
+    )
+
+    assert len(products) > 1
+    assert len({product.category for product in products}) > 1
+    assert all(product.price_cents <= 10000 for product in products)

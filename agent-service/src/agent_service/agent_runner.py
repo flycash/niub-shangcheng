@@ -264,11 +264,25 @@ def _optional_int(slots: dict[str, object], key: str) -> int | None:
     return None
 
 
+def recommendation_requirements_need_input(
+    goal: GoalUnderstandingResult,
+) -> bool:
+    requirements = goal.recommendation_requirements
+    return (
+        requirements is not None
+        and requirements.status == "collecting"
+    )
+
+
 def recommendation_demand_from_goal(
     goal: GoalUnderstandingResult,
     spec: RecommendationSpec | None = None,
 ) -> RecommendationDemand:
-    slots = goal.slots
+    slots = (
+        goal.recommendation_requirements.slots.model_dump(mode="json")
+        if goal.recommendation_requirements is not None
+        else goal.slots
+    )
     hard = spec.hard_constraints if spec is not None else None
     required_tags = slots.get("required_tags")
     excluded_tags = slots.get("excluded_tags")
@@ -276,7 +290,14 @@ def recommendation_demand_from_goal(
     if scenario not in {"general", "self", "gift", "replenishment"}:
         scenario = spec.scenario if spec is not None else "general"
     query = _optional_string(slots, "query")
-    if query is None and goal.primary_intent == "product_recommendation":
+    if (
+        query is None
+        and goal.primary_intent == "product_recommendation"
+        and not (
+            spec is not None
+            and spec.recall_mode == "broad"
+        )
+    ):
         query = (
             spec.search_queries[0]
             if spec is not None and spec.search_queries
@@ -769,6 +790,10 @@ def create_tools(
             return rejected("请先调用 understand_goal")
         if goal.primary_intent != "product_recommendation":
             return rejected("当前 primary_intent 不是商品推荐")
+        if recommendation_requirements_need_input(goal):
+            return rejected(
+                "推荐需求仍在收集，只能先向用户输出模型生成的 next_question"
+            )
         if context.recommendation_context is not None:
             snapshot = context.recommendation_context
             return json.dumps(
@@ -881,6 +906,10 @@ def create_tools(
             return rejected("Goal Understanding 表示需要先澄清关键信息")
         if goal.primary_intent != "product_recommendation":
             return rejected("当前 primary_intent 不是商品推荐")
+        if recommendation_requirements_need_input(goal):
+            return rejected(
+                "推荐需求仍在收集，请先完成模型生成的需求问题"
+            )
         snapshot = context.recommendation_context
         if snapshot is None:
             return rejected("请先调用 collect_recommendation_context")
@@ -1041,6 +1070,8 @@ def create_tools(
             return rejected("Goal Understanding 表示需要先向用户澄清关键信息")
         if goal.primary_intent != "product_recommendation":
             return rejected("当前 primary_intent 不是商品推荐")
+        if recommendation_requirements_need_input(goal):
+            return rejected("推荐需求仍在收集，暂不能提交推荐")
         snapshot = context.recommendation_context
         if snapshot is None:
             return rejected("请先调用 collect_recommendation_context")

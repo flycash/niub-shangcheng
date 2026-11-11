@@ -95,7 +95,11 @@ def _apply_explicit_goal_constraints(
     spec: RecommendationSpec,
     goal: GoalUnderstandingResult,
 ) -> RecommendationSpec:
-    slots = goal.slots
+    slots = (
+        goal.recommendation_requirements.slots.model_dump(mode="json")
+        if goal.recommendation_requirements is not None
+        else goal.slots
+    )
     hard = spec.hard_constraints
     category = slots.get("category")
     min_price = _non_negative_int(slots.get("min_price_cents"))
@@ -122,7 +126,7 @@ def _apply_explicit_goal_constraints(
         ),
     )
     scenario = slots.get("scenario")
-    if scenario not in {"general", "self", "gift", "replenishment"}:
+    if scenario not in {"general", "self", "gift", "replenishment", None}:
         scenario = spec.scenario
     usage = slots.get("usage")
     recipient = slots.get("recipient")
@@ -137,7 +141,7 @@ def _apply_explicit_goal_constraints(
         update={
             "hard_constraints": normalized_hard,
             "search_queries": queries,
-            "scenario": scenario,
+            "scenario": scenario or spec.scenario,
             "usage": (
                 usage
                 if isinstance(usage, str) and usage

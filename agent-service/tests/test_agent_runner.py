@@ -12,6 +12,7 @@ from agent_service.agent_runner import (
     ShoppingAgentContext,
     create_tools,
     normalize_openai_base_url,
+    recommendation_demand_from_goal,
     stream_agent_reply,
 )
 from agent_service.goal_understanding import AgentGoalUnderstander
@@ -26,6 +27,8 @@ from agent_service.models import (
     Product,
     RecommendationBatch,
     RecommendationDemand,
+    RecommendationRequirementSlots,
+    RecommendationRequirementState,
     RecommendationSpec,
     RecommendationSpecHardConstraints,
     ScoredProduct,
@@ -217,19 +220,32 @@ def goal_understanding(
     *,
     query: str = "通勤",
     intents: list[str] | None = None,
+    requirement_status: str = "ready",
+    next_question: str | None = None,
 ) -> GoalUnderstandingResult:
     ordered_intents = intents or ["product_recommendation"]
+    slots = {
+        "query": query,
+        "max_price_cents": 30000,
+        "scenario": "self",
+    }
     return GoalUnderstandingResult(
         primary_intent=ordered_intents[0],
         intents=ordered_intents,
         pending_intents=ordered_intents[1:],
         goal=f"推荐与 {query} 相关的商品",
         confidence=0.95,
-        slots={
-            "query": query,
-            "max_price_cents": 30000,
-            "scenario": "self",
-        },
+        slots=slots,
+        recommendation_requirements=RecommendationRequirementState(
+            status=requirement_status,
+            slots=RecommendationRequirementSlots(
+                query=query,
+                max_price_cents=30000,
+                scenario="self",
+            ),
+            next_question=next_question,
+            collection_reason="模型判断当前推荐需求状态",
+        ),
         pending_intent_question=(
             "当前已处理第一个意图。需要我继续处理后续意图吗？"
             if len(ordered_intents) > 1
@@ -255,6 +271,20 @@ def recommendation_spec(
         source_evidence=[],
         confidence=0.9,
     )
+
+
+def test_broad_recall_does_not_promote_diagnostic_query_to_demand() -> None:
+    goal = goal_understanding(
+        requirement_status="bypassed",
+        query="",
+    )
+    spec = recommendation_spec(queries=["通勤"]).model_copy(
+        update={"recall_mode": "broad"}
+    )
+
+    demand = recommendation_demand_from_goal(goal, spec)
+
+    assert demand.query == ""
 
 
 def scored_candidate(
@@ -523,6 +553,26 @@ def test_understand_goal_action_returns_first_intent_and_pending_intents() -> No
     assert context.goal_understanding is not None
 
 
+def test_collecting_requirements_block_recommendation_steps() -> None:
+    context = ShoppingAgentContext(mall=mall_client())
+    context.goal_understanding = goal_understanding(
+        requirement_status="collecting",
+        next_question="你最在意这个商品的什么特点？",
+    )
+
+    collected = json.loads(
+        invoke_tool(context, "collect_recommendation_context", {})
+    )
+    generated = json.loads(
+        invoke_tool(context, "generate_recommendation_spec", {})
+    )
+
+    assert collected["status"] == "rejected"
+    assert "next_question" in collected["message"]
+    assert generated["status"] == "rejected"
+    assert context.recommendation_context is None
+
+
 def test_goal_understanding_agent_uses_its_own_prompt() -> None:
     model = ScriptedModel(
         [
@@ -540,6 +590,23 @@ def test_goal_understanding_agent_uses_its_own_prompt() -> None:
                             "missing_slots": [],
                             "requires_clarification": False,
                             "clarification_question": None,
+                            "recommendation_requirements": {
+                                "status": "collecting",
+                                "slots": {
+                                    "query": "通勤包",
+                                    "category": "箱包",
+                                    "min_price_cents": None,
+                                    "max_price_cents": None,
+                                    "required_tags": [],
+                                    "excluded_tags": [],
+                                    "scenario": None,
+                                    "usage": "通勤",
+                                    "recipient": None,
+                                },
+                                "next_question": "你希望大概控制在什么价位？",
+                                "declined_requirements": [],
+                                "collection_reason": "还需要价格信息帮助筛选",
+                            },
                         },
                         ensure_ascii=False,
                     )
@@ -569,10 +636,78 @@ def test_goal_understanding_agent_uses_its_own_prompt() -> None:
 
     assert result.primary_intent == "product_recommendation"
     assert result.pending_intents == ["order_query"]
+    assert result.recommendation_requirements is not None
+    assert result.recommendation_requirements.status == "collecting"
+    assert result.recommendation_requirements.next_question == (
+        "你希望大概控制在什么价位？"
+    )
     assert model.first_call is not None
     assert "Goal Understanding" in (
         model.first_call.system_instructions or ""
     )
+
+
+def test_goal_understanding_can_bypass_requirement_collection() -> None:
+    model = ScriptedModel(
+        [
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "intents": ["product_recommendation"],
+                            "goal": "直接推荐商品",
+                            "confidence": 0.97,
+                            "slots": {},
+                            "missing_slots": [],
+                            "requires_clarification": False,
+                            "clarification_question": None,
+                            "recommendation_requirements": {
+                                "status": "bypassed",
+                                "slots": {
+                                    "query": None,
+                                    "category": None,
+                                    "min_price_cents": None,
+                                    "max_price_cents": None,
+                                    "required_tags": [],
+                                    "excluded_tags": [],
+                                    "scenario": None,
+                                    "usage": None,
+                                    "recipient": None,
+                                },
+                                "next_question": None,
+                                "declined_requirements": ["不回答推荐需求问题"],
+                                "collection_reason": "用户明确要求直接推荐",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ]
+        ]
+    )
+    understander = AgentGoalUnderstander(
+        config=llm_config(),
+        model=model,
+    )
+
+    result = asyncio.run(
+        understander.understand(
+            current_message="你别管那么多，直接推荐",
+            recent_messages=[
+                ConversationMessage(
+                    role="user",
+                    content="你别管那么多，直接推荐",
+                )
+            ],
+            previous_goal=None,
+            previous_recommendations=[],
+            previous_orders=[],
+        )
+    )
+
+    assert result.recommendation_requirements is not None
+    assert result.recommendation_requirements.status == "bypassed"
+    assert result.recommendation_requirements.next_question is None
 
 
 def test_collect_context_and_generate_recommendation_spec_are_separate_actions(
@@ -993,6 +1128,87 @@ def test_semantic_candidates_are_one_mixed_score_ordered_pool() -> None:
     ]
 
 
+def test_model_generated_requirement_question_ends_turn_without_recommendation() -> None:
+    question = "你更希望它适合通勤时装电脑，还是日常随身使用？"
+    model = ScriptedModel(
+        [
+            [
+                function_call(
+                    "understand_goal",
+                    {},
+                    call_id="call-goal",
+                )
+            ],
+            [
+                assistant_message(
+                    json.dumps(
+                        {
+                            "intents": ["product_recommendation"],
+                            "goal": "推荐一个通勤包",
+                            "confidence": 0.96,
+                            "slots": {"query": "通勤包"},
+                            "missing_slots": [],
+                            "requires_clarification": False,
+                            "clarification_question": None,
+                            "recommendation_requirements": {
+                                "status": "collecting",
+                                "slots": {
+                                    "query": "通勤包",
+                                    "category": "箱包",
+                                    "min_price_cents": None,
+                                    "max_price_cents": None,
+                                    "required_tags": [],
+                                    "excluded_tags": [],
+                                    "scenario": None,
+                                    "usage": "通勤",
+                                    "recipient": None,
+                                },
+                                "next_question": question,
+                                "declined_requirements": [],
+                                "collection_reason": "还需要明确具体使用方式",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ],
+            [assistant_message(question)],
+        ]
+    )
+
+    async def collect_events() -> list[dict[str, object]]:
+        return [
+            event
+            async for event in stream_agent_reply(
+                [ConversationMessage(role="user", content="推荐个通勤包")],
+                llm_config(),
+                mall_client(),
+                model_override=model,
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    started_tools = [
+        event["tool"]
+        for event in events
+        if event["type"] == "tool_started"
+    ]
+    text = "".join(
+        str(event["content"])
+        for event in events
+        if event["type"] == "delta"
+    )
+    done = next(event for event in events if event["type"] == "done")
+
+    assert started_tools == ["understand_goal"]
+    assert text == question
+    assert done["recommendations"] == []
+    assert done["goal_understanding"]["recommendation_requirements"][
+        "status"
+    ] == "collecting"
+
+
 def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
     model = ScriptedModel(
         [
@@ -1023,6 +1239,23 @@ def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
                             "missing_slots": [],
                             "requires_clarification": False,
                             "clarification_question": None,
+                            "recommendation_requirements": {
+                                "status": "ready",
+                                "slots": {
+                                    "query": "通勤",
+                                    "category": None,
+                                    "min_price_cents": None,
+                                    "max_price_cents": 30000,
+                                    "required_tags": [],
+                                    "excluded_tags": [],
+                                    "scenario": "self",
+                                    "usage": "通勤",
+                                    "recipient": None,
+                                },
+                                "next_question": None,
+                                "declined_requirements": [],
+                                "collection_reason": "商品目标和预算已足够",
+                            },
                         },
                         ensure_ascii=False,
                     )
@@ -1171,6 +1404,9 @@ def test_react_loop_loads_sources_and_streams_only_final_selection() -> None:
         model.first_call.system_instructions or ""
     )
     assert "pending_intent_question" in (
+        model.first_call.system_instructions or ""
+    )
+    assert "status = collecting" in (
         model.first_call.system_instructions or ""
     )
 

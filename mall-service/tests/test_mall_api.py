@@ -195,6 +195,42 @@ def test_spec_ad_search_returns_ad_candidates() -> None:
     assert all(item["ad"]["is_ad"] is True for item in ads)
 
 
+def test_broad_spec_search_does_not_require_keyword_match() -> None:
+    spec = {
+        "goal_summary": "用户跳过需求收集，按历史偏好宽泛推荐",
+        "hard_constraints": {
+            "category": None,
+            "min_price_cents": None,
+            "max_price_cents": 10000,
+            "required_tags": [],
+            "excluded_tags": [],
+        },
+        "preferred_categories": ["箱包"],
+        "preferred_tags": ["通勤"],
+        "weak_categories": [],
+        "negative_tags": [],
+        "search_queries": ["通勤"],
+        "recall_mode": "broad",
+        "scenario": "self",
+        "usage": None,
+        "recipient": None,
+        "source_evidence": [],
+        "confidence": 0.7,
+        "missing_information": [],
+    }
+
+    response = client.post(
+        "/api/search/organic",
+        json={"spec": spec, "limit": 10},
+    )
+
+    assert response.status_code == 200
+    products = response.json()["items"]
+    assert len(products) > 1
+    assert len({product["category"] for product in products}) > 1
+    assert all(product["price_cents"] <= 10000 for product in products)
+
+
 def test_create_order_uses_catalog_snapshot_and_is_idempotent() -> None:
     body = {
         "items": [{"product_id": "commuter-backpack", "quantity": 1}],

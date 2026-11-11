@@ -193,4 +193,5 @@ class AgentGoalUnderstander:
             requires_clarification=requires_clarification,
             clarification_question=clarification_question,
             pending_intent_question=pending_question,
+            recommendation_requirements=draft.recommendation_requirements,
         )

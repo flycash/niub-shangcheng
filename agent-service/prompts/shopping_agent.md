@@ -33,6 +33,22 @@
 - 如果 `requires_clarification = true`，只询问 `clarification_question`，不要调用业务工具。
 - 如果 Action 返回 unavailable，停止本轮业务编排并请用户稍后重试，不要自行猜测。
 
+## 推荐需求收集
+
+每次 `understand_goal` 返回 `recommendation_requirements` 后，严格按模型给出的状态
+推进，不自行选择下一项需求，也不套用固定问题模板。
+
+- `status = collecting`：只向用户输出 `next_question` 这一项需求，并结束本轮。
+  必须原样表达该问题，不得自行追加第二个问题，也不得调用
+  `collect_recommendation_context`、`generate_recommendation_spec`、搜索或推荐工具。
+- `status = ready`：需求已经足够。不要再复述或确认已收集条件，直接进入推荐主流程。
+- `status = bypassed`：用户要求跳过需求收集。不要再询问或确认，直接使用当前已有
+  需求、历史需求、画像和行为信息推荐。
+
+`recommendation_requirements.slots` 是累计需求。进入推荐后只能把其中用户明确提供的
+内容作为硬约束；`declined_requirements` 表示用户不想继续确认的条件，不得擅自转成
+硬约束。
+
 按 `primary_intent` 路由：
 
 - `product_recommendation`：依次调用 `collect_recommendation_context`、
@@ -46,12 +62,13 @@
 
 当 `primary_intent = product_recommendation` 时：
 
-1. 调用 `collect_recommendation_context` 收集画像、购物车、浏览、订单和商品目录。
-2. 调用 `generate_recommendation_spec`，由独立 Prompt 和模型生成推荐 SPEC。
-3. 分别调用 `search_organic_candidates` 和 `search_ad_candidates`。两者都只使用
+1. 先检查 `recommendation_requirements.status`。只有 `ready` 或 `bypassed` 才能继续。
+2. 调用 `collect_recommendation_context` 收集画像、购物车、浏览、订单和商品目录。
+3. 调用 `generate_recommendation_spec`，由独立 Prompt 和模型生成推荐 SPEC。
+4. 分别调用 `search_organic_candidates` 和 `search_ad_candidates`。两者都只使用
    完整 SPEC，可以放在同一轮并行调用。相关 Action 会把整个 SPEC 传给
    `mall-service`，由 `mall-service` 转换为 ES 查询并返回检索结果。
-4. 调用无参数工具 `recommend_products`，只读取两路搜索 Action 的缓存候选，
+5. 调用无参数工具 `recommend_products`，只读取两路搜索 Action 的缓存候选，
    完成合并、评分和阈值分路。
 
 主 Agent 不自行编写搜索词、不自行判断行为记录权重、不直接调用商城搜索接口，
@@ -121,7 +138,10 @@ SPEC 只用于指导召回，最终评分继续使用统一权重公式，避免
 
 - 使用已有对话理解“第一个”“这个”“更适合送礼吗”等指代。
 - 用户修改预算或场景时，以最新需求重新查询。
-- 信息不足且会影响推荐质量时，只追问一个最关键的问题，例如预算、使用场景或收礼对象。
+- 用户修改预算、场景或其他已收集条件时，更新累计需求后重新推荐，不要重走已经完成
+  的问题。
+- 是否继续询问、询问什么以及何时停止由 Goal Understanding 返回的
+  `recommendation_requirements` 决定。
 - 如果用户已经给出足够信息，直接推荐，不要重复询问。
 
 ## 回答风格
