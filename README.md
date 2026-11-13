@@ -1,6 +1,6 @@
 # 牛掰商城
 
-项目拆分为三个可独立运行的模块：
+项目拆分为以下可独立运行的模块：
 
 ```text
 浏览器
@@ -11,12 +11,21 @@ web (Next.js :3000)
   └── /api/chat ──────► agent-service (:8002)
                               ├── OpenAI Agents SDK
                               └── HTTP ──► mall-service Mock APIs
+
+运营人员
+  │
+  ▼
+admin-web (Next.js :3001)
+  └── HTTP ──► admin-backend (:8003)
+                    └── HTTP ──► agent-service (:8002)
 ```
 
 - `mall-service`：商城商品目录，以及浏览、订单、购物车、平台画像、商品推荐和广告的 Mock HTTP API。
 - `agent-service`：基于 OpenAI Agents SDK 的商城导购 Agent，通过工具调用
   `mall-service`，并使用 Agent 本地维护的用户画像。
 - `web`：Next.js 商城页面，浏览器只访问同源的 Next.js API 路由。
+- `admin-backend`：内部运营 API，聚合 `agent-service` 的对话、消息和定时总结。
+- `admin-web`：内部运营后台，提供对话列表和对话详情查看。
 
 ## 启动
 
@@ -26,7 +35,7 @@ web (Next.js :3000)
 uv sync --all-packages
 ```
 
-分别在三个终端启动服务：
+分别在需要的终端启动服务：
 
 ```bash
 uv run --package mall-service mall-service
@@ -42,6 +51,21 @@ pnpm --dir web dev
 ```
 
 打开 <http://localhost:3000>。
+
+启动运营后台：
+
+```bash
+uv run --package admin-backend admin-backend
+```
+
+```bash
+pnpm --dir admin-web install
+pnpm --dir admin-web dev
+```
+
+打开 <http://localhost:3001>，默认进入 `/conversations`。`admin-backend` 默认只
+监听 `127.0.0.1:8003`，通过 `AGENT_SERVICE_URL` 访问 Agent 服务。该模块当前定位
+为内部轻量后台，不包含登录和权限系统，因此不应直接暴露到公网。
 
 ## 大模型配置
 
@@ -93,6 +117,7 @@ agent-service/prompts/shopping_agent.md
 agent-service/prompts/goal_understanding.md
 agent-service/prompts/recommendation_spec.md
 agent-service/prompts/recommendation_reranker.md
+agent-service/prompts/conversation_summary.md
 ```
 
 主 Agent、Goal Understanding Agent 和语义终排 Agent 各自在所属模块中声明
@@ -123,6 +148,11 @@ Prompt 路径，并通过
 - Agent SSE 多轮对话：`POST http://localhost:8002/api/chat/stream`
 - 历史对话列表：`GET http://localhost:8002/api/conversations`
 - 历史对话详情：`GET http://localhost:8002/api/conversations/{conversation_id}`
+- 对话总结：`GET http://localhost:8002/api/conversations/{conversation_id}/summary`
+- Admin 手动生成总结：`POST http://localhost:8002/api/admin/conversations/{conversation_id}/summary`
+- Admin 对话列表：`GET http://localhost:8003/api/conversations`
+- Admin 对话详情及总结：`GET http://localhost:8003/api/conversations/{conversation_id}`
+- Admin 手动生成总结：`POST http://localhost:8003/api/conversations/{conversation_id}/summary`
 
 对话请求示例：
 
@@ -135,6 +165,7 @@ Prompt 路径，并通过
 ```bash
 uv run pytest
 pnpm --dir web build
+pnpm --dir admin-web build
 ```
 
 `/api/chat/stream` 使用 OpenAI Agents SDK 的 Chat Completions 模型适配器，
@@ -154,6 +185,21 @@ pnpm --dir web build
 服务保存用户消息、完整回复、失败回复及中断时已经生成的部分内容。模型上下文
 只使用用户消息和状态为 `completed` 的助手消息。`/chat` 页面会展示历史对话
 列表，并允许选择历史会话继续对话。
+
+## 对话总结与运营后台
+
+`agent-service` 每小时扫描一次，只自动总结超过一小时没有更新、且时间戳表明内容
+发生变化的对话。对话被重新使用后，下一次满足闲置条件的扫描会重新生成并替换当前
+总结。商城用户没有主动触发接口；运营人员可以在 admin 对话详情页手动生成或重新
+生成总结。
+
+总结包括对话目标、约束、推荐商品和最终推荐理由、商品规格等关键信息、用户的商品
+反馈、明确表达的一般偏好以及未解决事项。`admin-web` 在对话详情页展示总结和完整
+消息；尚未生成总结的对话会显示等待定时任务处理的状态。
+
+最新一小时内的对话可能还没有可用总结。后续对话召回需要回退到原始消息，该事项
+记录在 `conversation_summary_worker.py` 的
+`TODO(conversation-summary-freshness)` 中。
 
 ## 推荐商品 Agent
 

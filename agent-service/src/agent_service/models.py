@@ -325,6 +325,24 @@ class SemanticRankingResult(BaseModel):
     summary: str = Field(default="", max_length=1_000)
 
 
+class FinalRecommendation(BaseModel):
+    product_id: str = Field(min_length=1, max_length=100)
+    rank: int = Field(ge=1)
+    channel: Literal["organic", "ad"]
+    reason: str = Field(min_length=1, max_length=500)
+    reason_source: Literal[
+        "semantic_reranker",
+        "formula_scoring",
+        "unavailable",
+    ]
+    environmental_fit: str | None = Field(default=None, max_length=500)
+
+
+class RecommendationDecision(BaseModel):
+    summary: str = Field(default="", max_length=1_000)
+    items: list[FinalRecommendation] = Field(default_factory=list)
+
+
 PlanStepStatus = Literal[
     "pending",
     "in_progress",
@@ -429,6 +447,7 @@ class StoredMessage(BaseModel):
     goal_understanding: GoalUnderstandingResult | None = None
     recommendation_spec: RecommendationSpec | None = None
     orders: list[OrderLink] = Field(default_factory=list)
+    recommendation_decision: RecommendationDecision | None = None
 
 
 class ConversationSummary(BaseModel):
@@ -445,3 +464,97 @@ class ConversationDetail(ConversationSummary):
 
 class ConversationList(BaseModel):
     items: list[ConversationSummary]
+
+
+class ConversationEvidence(BaseModel):
+    message_id: str = Field(min_length=1, max_length=100)
+    quote: str = Field(min_length=1, max_length=2_000)
+
+
+class ProductKeyInformation(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    value: str = Field(min_length=1, max_length=500)
+    source_field: Literal[
+        "name",
+        "description",
+        "category",
+        "tags",
+        "badge",
+    ]
+    source_text: str = Field(min_length=1, max_length=2_000)
+
+
+class ProductKeyInformationGroup(BaseModel):
+    product_id: str = Field(min_length=1, max_length=100)
+    items: list[ProductKeyInformation] = Field(default_factory=list)
+
+
+class FeedbackAspect(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    value: str | None = Field(default=None, max_length=500)
+    polarity: Literal["positive", "negative", "neutral", "uncertain"]
+
+
+class ProductFeedback(BaseModel):
+    product_id: str = Field(min_length=1, max_length=100)
+    overall: Literal["positive", "negative", "neutral", "mixed", "unclear"]
+    aspects: list[FeedbackAspect] = Field(default_factory=list)
+    evidence: list[ConversationEvidence] = Field(min_length=1)
+    confidence: float = Field(ge=0, le=1)
+
+
+class GeneralPreference(BaseModel):
+    dimension: str = Field(min_length=1, max_length=100)
+    value: str = Field(min_length=1, max_length=500)
+    polarity: Literal["prefer", "avoid"]
+    evidence: list[ConversationEvidence] = Field(min_length=1)
+    confidence: float = Field(ge=0, le=1)
+
+
+class ConversationSummaryDraft(BaseModel):
+    summary: str = Field(min_length=1, max_length=4_000)
+    user_goals: list[str] = Field(default_factory=list)
+    explicit_constraints: list[str] = Field(default_factory=list)
+    product_key_information: list[ProductKeyInformationGroup] = Field(
+        default_factory=list
+    )
+    product_feedback: list[ProductFeedback] = Field(default_factory=list)
+    general_preferences: list[GeneralPreference] = Field(default_factory=list)
+    unresolved_items: list[str] = Field(default_factory=list)
+
+
+class RecommendedProductSummary(BaseModel):
+    product: Product
+    key_information: list[ProductKeyInformation] = Field(default_factory=list)
+    reason: str | None = Field(default=None, max_length=500)
+    reason_source: Literal[
+        "semantic_reranker",
+        "formula_scoring",
+        "unavailable",
+    ] = "unavailable"
+    environmental_fit: str | None = Field(default=None, max_length=500)
+
+
+class RecommendationRoundSummary(BaseModel):
+    assistant_message_id: str = Field(min_length=1, max_length=100)
+    user_request: str = Field(min_length=1, max_length=100_000)
+    ranking_summary: str = Field(default="", max_length=1_000)
+    products: list[RecommendedProductSummary] = Field(default_factory=list)
+
+
+class ConversationDigest(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=100)
+    source_updated_at: str = Field(min_length=1, max_length=100)
+    summary: str = Field(min_length=1, max_length=4_000)
+    user_goals: list[str] = Field(default_factory=list)
+    explicit_constraints: list[str] = Field(default_factory=list)
+    recommendation_rounds: list[RecommendationRoundSummary] = Field(
+        default_factory=list
+    )
+    product_feedback: list[ProductFeedback] = Field(default_factory=list)
+    general_preferences: list[GeneralPreference] = Field(
+        default_factory=list
+    )
+    unresolved_items: list[str] = Field(default_factory=list)
+    source_message_ids: list[str] = Field(default_factory=list)
+    generated_at: str = Field(min_length=1, max_length=100)

@@ -868,6 +868,12 @@ def test_recommend_products_formula_path_selects_top_two() -> None:
         product.is_ad is False
         for product in context.selected_products.values()
     )
+    assert context.recommendation_decision is not None
+    assert len(context.recommendation_decision.items) == 2
+    assert {
+        item.reason_source
+        for item in context.recommendation_decision.items
+    } == {"formula_scoring"}
 
 
 def test_recommend_products_returns_no_match_without_eligible_candidates() -> None:
@@ -952,6 +958,17 @@ def test_semantic_reranker_selects_organic_before_ad() -> None:
     assert context.selected_products["portable-coffee"].is_ad is True
     assert context.selected_products["portable-coffee"].ad_label == "广告"
     assert reranker.environment_context == "明早通勤，需要轻便"
+    assert context.recommendation_decision is not None
+    assert [
+        item.reason for item in context.recommendation_decision.items
+    ] == [
+        "更符合通勤用途",
+        "补充办公室饮用场景",
+    ]
+    assert {
+        item.reason_source
+        for item in context.recommendation_decision.items
+    } == {"semantic_reranker"}
 
 
 def test_semantic_reranker_falls_back_when_ad_is_first() -> None:

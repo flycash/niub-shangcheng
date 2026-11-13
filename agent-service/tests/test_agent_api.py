@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from agent_service.api import app
 from agent_service.agent_runner import sse_event
 from agent_service.llm_config import LLMConfig, LLMConfigError
 from agent_service.mall_client import get_mall_client
-from agent_service.models import Product, ProductList
+from agent_service.models import ConversationDigest, Product, ProductList
 from agent_service.storage import ConversationStore, get_conversation_store
 
 client = TestClient(app)
@@ -155,6 +156,20 @@ RECOMMENDATION_SPEC = {
     "missing_information": [],
 }
 
+RECOMMENDATION_DECISION = {
+    "summary": "自然商品优先",
+    "items": [
+        {
+            "product_id": "tote",
+            "rank": 1,
+            "channel": "ad",
+            "reason": "通勤容量和现有需求最匹配",
+            "reason_source": "semantic_reranker",
+            "environmental_fit": "适合办公室通勤",
+        }
+    ],
+}
+
 
 async def fake_agent_stream(
     messages,
@@ -216,6 +231,7 @@ async def fake_agent_stream(
         "recommendations": [RECOMMENDED_PRODUCT],
         "goal_understanding": GOAL_UNDERSTANDING,
         "recommendation_spec": RECOMMENDATION_SPEC,
+        "recommendation_decision": RECOMMENDATION_DECISION,
     }
 
 
@@ -302,6 +318,11 @@ def test_stream_chat_persists_completed_conversation(
         "通勤",
         "办公室",
     ]
+    assert detail.messages[1].recommendation_decision is not None
+    assert (
+        detail.messages[1].recommendation_decision.items[0].reason
+        == "通勤容量和现有需求最匹配"
+    )
     assert detail.messages[1].tool_trace[0].tool == "search_products"
     assert detail.messages[1].plan_state is not None
     assert detail.messages[1].plan_state.plan.plan_id == "plan-test"
@@ -484,6 +505,87 @@ def test_conversation_history_endpoints(store: ConversationStore) -> None:
     assert list_response.json()["items"][0]["message_count"] == 2
     assert detail_response.status_code == 200
     assert detail_response.json()["messages"][1]["content"] == "推荐托特包"
+
+
+def test_conversation_summary_is_read_only_and_requires_saved_digest(
+    store: ConversationStore,
+) -> None:
+    conversation_id = store.create_conversation(1, "购买礼物")
+    store.add_message(conversation_id, "user", "购买礼物", "completed")
+    store.add_message(conversation_id, "assistant", "推荐托特包", "completed")
+    conversation = store.get_conversation(1, conversation_id)
+    assert conversation is not None
+
+    missing = client.get(f"/api/conversations/{conversation_id}/summary")
+    manual_trigger = client.post(
+        f"/api/conversations/{conversation_id}/summary"
+    )
+    assert missing.status_code == 404
+    assert manual_trigger.status_code == 405
+
+    store.save_conversation_summary(
+        ConversationDigest(
+            conversation_id=conversation_id,
+            source_updated_at=conversation.updated_at,
+            summary="用户为送礼场景咨询了托特包。",
+            generated_at="2026-11-13T03:00:00.000+00:00",
+        ),
+        prompt_version="conversation-summary-v1",
+        summarizer_model="test-model",
+    )
+
+    response = client.get(
+        f"/api/conversations/{conversation_id}/summary"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["source_updated_at"] == conversation.updated_at
+    assert response.json()["summary"] == "用户为送礼场景咨询了托特包。"
+
+
+def test_admin_can_manually_generate_conversation_summary(
+    store: ConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation_id = store.create_conversation(1, "手动总结")
+    store.add_message(conversation_id, "user", "推荐一个通勤包", "completed")
+    store.add_message(
+        conversation_id,
+        "assistant",
+        "推荐这款轻量通勤包。",
+        "completed",
+    )
+    conversation = store.get_conversation(1, conversation_id)
+    assert conversation is not None
+
+    class FakeSummarizer:
+        async def summarize(self, *, conversation, source_updated_at):
+            return ConversationDigest(
+                conversation_id=conversation.id,
+                source_updated_at=source_updated_at,
+                summary="用户正在寻找通勤包。",
+                generated_at="2026-11-13T04:00:00.000+00:00",
+            )
+
+    @asynccontextmanager
+    async def fake_summarizer_factory():
+        yield FakeSummarizer(), "test-summary-model"
+
+    monkeypatch.setattr(
+        api_module,
+        "configured_conversation_summarizer",
+        fake_summarizer_factory,
+    )
+
+    response = client.post(
+        f"/api/admin/conversations/{conversation_id}/summary"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"] == "用户正在寻找通勤包。"
+    stored = store.get_conversation_summary(1, conversation_id)
+    assert stored is not None
+    assert stored.source_updated_at == conversation.updated_at
 
 
 def test_unknown_conversation_returns_404(store: ConversationStore) -> None:

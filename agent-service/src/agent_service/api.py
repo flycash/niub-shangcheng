@@ -1,18 +1,26 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .agent_runner import sse_event, stream_agent_reply
 from .chat import compose_reply
+from .conversation_summary_worker import (
+    ConversationSummaryWorker,
+    configured_conversation_summarizer,
+    load_conversation_summary_settings,
+    summarize_and_store_conversation,
+)
 from .llm_config import LLMConfig, LLMConfigError, load_llm_config
 from .mall_client import CatalogUnavailable, MallClient, get_mall_client
 from .mall_gateway import MallGateway
 from .models import (
     ChatRequest,
     ChatResponse,
+    ConversationDigest,
     ConversationDetail,
     ConversationList,
     ConversationMessage,
@@ -20,6 +28,7 @@ from .models import (
     OrderLink,
     PlanState,
     Product,
+    RecommendationDecision,
     RecommendationSpec,
     StreamChatRequest,
     StoredMessage,
@@ -31,7 +40,34 @@ from .storage import FIXED_USER_ID, ConversationStore, get_conversation_store
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Agent Service", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    settings = load_conversation_summary_settings()
+    task: asyncio.Task[None] | None = None
+    if settings.enabled:
+        worker = ConversationSummaryWorker(
+            get_conversation_store(),
+            settings=settings,
+        )
+        task = asyncio.create_task(
+            worker.run_forever(),
+            name="conversation-summary-worker",
+        )
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(
+    title="Agent Service",
+    version="0.1.0",
+    lifespan=lifespan,
+)
 
 
 def to_conversation_messages(
@@ -95,6 +131,7 @@ async def persisted_agent_stream(
     plan_state: PlanState | None = None
     goal_understanding: GoalUnderstandingResult | None = None
     recommendation_spec: RecommendationSpec | None = None
+    recommendation_decision: RecommendationDecision | None = None
     created_orders: dict[str, OrderLink] = {}
     persisted = False
     chat_outcome = "failed"
@@ -123,6 +160,10 @@ async def persisted_agent_stream(
         if recommendation_spec is not None:
             metadata["recommendation_spec"] = recommendation_spec.model_dump(
                 mode="json"
+            )
+        if recommendation_decision is not None:
+            metadata["recommendation_decision"] = (
+                recommendation_decision.model_dump(mode="json")
             )
         if created_orders:
             metadata["orders"] = [
@@ -240,6 +281,13 @@ async def persisted_agent_stream(
                     recommendation_spec = RecommendationSpec.model_validate(
                         spec_payload
                     )
+                decision_payload = event.get("recommendation_decision")
+                if isinstance(decision_payload, dict):
+                    recommendation_decision = (
+                        RecommendationDecision.model_validate(
+                            decision_payload
+                        )
+                    )
                 store.finish_message(
                     assistant_message_id,
                     "".join(content_parts) or error_message,
@@ -280,6 +328,13 @@ async def persisted_agent_stream(
                 if isinstance(spec_payload, dict):
                     recommendation_spec = RecommendationSpec.model_validate(
                         spec_payload
+                    )
+                decision_payload = event.get("recommendation_decision")
+                if isinstance(decision_payload, dict):
+                    recommendation_decision = (
+                        RecommendationDecision.model_validate(
+                            decision_payload
+                        )
                     )
                 store.finish_message(
                     assistant_message_id,
@@ -402,6 +457,62 @@ def get_conversation(
     if conversation is None:
         raise HTTPException(status_code=404, detail="对话不存在")
     return conversation
+
+
+@app.get(
+    "/api/conversations/{conversation_id}/summary",
+    response_model=ConversationDigest,
+)
+def get_conversation_summary(
+    conversation_id: str,
+    store: ConversationStore = Depends(get_conversation_store),
+) -> ConversationDigest:
+    conversation = store.get_conversation(FIXED_USER_ID, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    summary = store.get_conversation_summary(FIXED_USER_ID, conversation_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="对话总结尚未生成")
+    return summary
+
+
+@app.post(
+    "/api/admin/conversations/{conversation_id}/summary",
+    response_model=ConversationDigest,
+)
+async def trigger_conversation_summary(
+    conversation_id: str,
+    store: ConversationStore = Depends(get_conversation_store),
+) -> ConversationDigest:
+    conversation = store.get_conversation(FIXED_USER_ID, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    try:
+        async with configured_conversation_summarizer() as (
+            summarizer,
+            summarizer_model,
+        ):
+            return await summarize_and_store_conversation(
+                store,
+                conversation=conversation,
+                source_updated_at=conversation.updated_at,
+                summarizer=summarizer,
+                summarizer_model=summarizer_model,
+            )
+    except LLMConfigError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"总结模型配置不可用：{exc}",
+        ) from exc
+    except Exception as exc:
+        logger.exception(
+            "manual conversation summary failed for %s",
+            conversation_id,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="对话总结生成失败，请稍后重试",
+        ) from exc
 
 
 @app.post("/api/chat", response_model=ChatResponse)

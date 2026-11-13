@@ -48,6 +48,38 @@ coverage/
 *.tsbuildinfo
 .turbo/
 
+# Admin web (Next.js)
+admin-web/node_modules/
+admin-web/.next/
+admin-web/out/
+admin-web/build/
+admin-web/coverage/
+admin-web/.vercel/
+admin-web/.turbo/
+admin-web/*.tsbuildinfo
+admin-web/pnpm-debug.log*
+admin-web/.env
+admin-web/.env.*
+!admin-web/.env.example
+
+# Admin backend (FastAPI)
+admin-backend/.venv/
+admin-backend/venv/
+admin-backend/**/__pycache__/
+admin-backend/**/*.py[cod]
+admin-backend/.pytest_cache/
+admin-backend/.mypy_cache/
+admin-backend/.ruff_cache/
+admin-backend/.coverage
+admin-backend/.coverage.*
+admin-backend/htmlcov/
+admin-backend/dist/
+admin-backend/build/
+admin-backend/**/*.egg-info/
+admin-backend/.env
+admin-backend/.env.*
+!admin-backend/.env.example
+
 # IDE and operating system
 .idea/
 .vscode/

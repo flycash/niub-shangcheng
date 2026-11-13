@@ -39,6 +39,7 @@ from .models import (
     BrowseEvent,
     ConversationMessage,
     CreateOrderItem,
+    FinalRecommendation,
     GoalUnderstandingResult,
     OrderLink,
     OrderRecord,
@@ -51,6 +52,7 @@ from .models import (
     ProductList,
     RecommendationBatch,
     RecommendationDemand,
+    RecommendationDecision,
     RecommendationSpec,
     ScoredProduct,
     SemanticRankingResult,
@@ -148,6 +150,7 @@ class ShoppingAgentContext:
     semantic_ranking: SemanticRankingResult | None = None
     semantic_reranker: SemanticReranker | None = None
     selected_products: dict[str, Product] = field(default_factory=dict)
+    recommendation_decision: RecommendationDecision | None = None
     created_orders: dict[str, OrderLink] = field(default_factory=dict)
     submitted: bool = False
     tool_trace: list[ToolTrace] = field(default_factory=list)
@@ -178,6 +181,7 @@ async def commit_scored_products(
     allow_ad_first: bool = True,
 ) -> list[Product]:
     selected: dict[str, Product] = {}
+    selected_candidates: list[tuple[Product, ScoredProduct]] = []
     for candidate in candidates:
         try:
             product = await context.mall.get_product(candidate.product.id)
@@ -200,6 +204,7 @@ async def commit_scored_products(
                 }
             )
         selected[product.id] = product
+        selected_candidates.append((product, candidate))
 
     if (
         not allow_ad_first
@@ -207,10 +212,63 @@ async def commit_scored_products(
         and next(iter(selected.values())).is_ad
     ):
         selected = {}
+        selected_candidates = []
 
     context.selected_products = selected
+    context.recommendation_decision = RecommendationDecision(
+        items=[
+            FinalRecommendation(
+                product_id=product.id,
+                rank=rank,
+                channel=candidate.channel,
+                reason=formula_recommendation_reason(candidate),
+                reason_source="formula_scoring",
+            )
+            for rank, (product, candidate) in enumerate(
+                selected_candidates,
+                start=1,
+            )
+        ]
+    )
     context.submitted = True
     return list(selected.values())
+
+
+def formula_recommendation_reason(candidate: ScoredProduct) -> str:
+    reasons = list(
+        dict.fromkeys(
+            evidence.reason.strip()
+            for evidence in candidate.evidence
+            if evidence.reason.strip()
+        )
+    )
+    if reasons:
+        return "；".join(reasons[:3])[:500]
+    return f"综合评分 {candidate.score:.1f}，满足当前推荐条件"
+
+
+def semantic_recommendation_decision(
+    ranking: SemanticRankingResult,
+    selected_products: Sequence[Product],
+) -> RecommendationDecision:
+    selected_ids = {product.id for product in selected_products}
+    ranked_items = [
+        item for item in ranking.items if item.product_id in selected_ids
+    ]
+    return RecommendationDecision(
+        summary=ranking.summary,
+        items=[
+            FinalRecommendation(
+                product_id=item.product_id,
+                rank=rank,
+                channel=item.channel,
+                reason=item.reason,
+                reason_source="semantic_reranker",
+                environmental_fit=item.environmental_fit,
+            )
+            for rank, item in enumerate(ranked_items, start=1)
+        ],
+    )
 
 
 def product_payload(products: Sequence[Product]) -> str:
@@ -1093,6 +1151,7 @@ def create_tools(
         context.remember_products(organic_products)
         context.remember_candidates(ad_candidates)
         context.selected_products.clear()
+        context.recommendation_decision = None
         context.semantic_ranking = None
         context.submitted = False
 
@@ -1198,6 +1257,10 @@ def create_tools(
             allow_ad_first=batch.ad_only,
         )
         context.semantic_ranking = ranking
+        context.recommendation_decision = semantic_recommendation_decision(
+            ranking,
+            selected,
+        )
         return json.dumps(
             {
                 "status": "accepted" if selected else "no_match",
@@ -1532,6 +1595,11 @@ async def stream_agent_reply(
                 if context.recommendation_spec is not None
                 else None
             ),
+            "recommendation_decision": (
+                context.recommendation_decision.model_dump(mode="json")
+                if context.recommendation_decision is not None
+                else None
+            ),
         }
     except PromptLoadError as exc:
         trace_session.finish("failed", exc)
@@ -1561,6 +1629,11 @@ async def stream_agent_reply(
             "recommendation_spec": (
                 context.recommendation_spec.model_dump(mode="json")
                 if context.recommendation_spec is not None
+                else None
+            ),
+            "recommendation_decision": (
+                context.recommendation_decision.model_dump(mode="json")
+                if context.recommendation_decision is not None
                 else None
             ),
         }
@@ -1598,6 +1671,11 @@ async def stream_agent_reply(
             "recommendation_spec": (
                 context.recommendation_spec.model_dump(mode="json")
                 if context.recommendation_spec is not None
+                else None
+            ),
+            "recommendation_decision": (
+                context.recommendation_decision.model_dump(mode="json")
+                if context.recommendation_decision is not None
                 else None
             ),
         }
@@ -1638,6 +1716,11 @@ async def stream_agent_reply(
             "recommendation_spec": (
                 context.recommendation_spec.model_dump(mode="json")
                 if context.recommendation_spec is not None
+                else None
+            ),
+            "recommendation_decision": (
+                context.recommendation_decision.model_dump(mode="json")
+                if context.recommendation_decision is not None
                 else None
             ),
         }
